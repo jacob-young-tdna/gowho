@@ -72,7 +72,7 @@ const (
 
 // Database: Batch Sizes
 const (
-	batchSizeThreshold = 10000 // File stats batch size before flush (increased for write performance)
+	batchSizeThreshold = 2500 // File stats batch size before flush (increased for write performance)
 	dbFile             = "git-who.db"
 )
 
@@ -229,7 +229,7 @@ type Metrics struct {
 	_              [56]byte // Cache line padding
 
 	filesSkipped atomic.Int64 // Files skipped due to timeout or other issues
-	_            [56]byte      // Cache line padding
+	_            [56]byte     // Cache line padding
 }
 
 var metrics Metrics
