@@ -1038,10 +1038,11 @@ func preflightCountFiles(repos []RepoInfo) []RepoInfo {
 
 // parseGitBlamePorcelain parses git blame --line-porcelain output and aggregates by author
 // Uses a scanner for streaming to avoid loading entire output into memory
-func parseGitBlamePorcelain(scanner *bufio.Scanner) map[string]int {
-	authorCounts := make(map[string]int, authorCountsCapacity)
+// Returns map keyed by interned AuthorID instead of email string
+func parseGitBlamePorcelain(scanner *bufio.Scanner) map[uint32]int {
+	authorCounts := make(map[uint32]int, authorCountsCapacity)
 
-	var currentAuthor string
+	var currentAuthorID uint32
 
 	for scanner.Scan() {
 		line := scanner.Bytes() // Avoid string allocation
@@ -1051,13 +1052,14 @@ func parseGitBlamePorcelain(scanner *bufio.Scanner) map[string]int {
 			// Extract email, removing angle brackets
 			email := line[12:] // Skip "author-mail "
 			if len(email) > 2 && email[0] == '<' && email[len(email)-1] == '>' {
-				currentAuthor = string(email[1 : len(email)-1])
+				emailStr := string(email[1 : len(email)-1])
+				currentAuthorID = authorIntern.Intern(emailStr)
 			}
 		} else if len(line) > 0 && line[0] == '\t' {
 			// Tab-prefixed lines are actual content lines
-			if currentAuthor != "" {
-				authorCounts[currentAuthor]++
-				currentAuthor = ""
+			if currentAuthorID != 0 {
+				authorCounts[currentAuthorID]++
+				currentAuthorID = 0
 			}
 		}
 	}
