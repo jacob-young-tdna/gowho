@@ -29,6 +29,7 @@ const (
 	fileTaskBuffer     = 500  // Reduced from 1000
 	contributionBuffer = 1000 // Reduced from 5000 (280KB → 56KB)
 	repoTaskBuffer     = 50   // Reduced from 100
+	gitBlameTimeout    = 10 * time.Second // Timeout for individual git blame operations
 )
 
 // UI status indicators (ASCII only)
@@ -90,6 +91,7 @@ type RepoProgress struct {
 	Status       string // "queued", "discovering", "blaming", "commits", "done", "error"
 	FilesTotal   int32
 	FilesBlamed  int32
+	FilesSkipped int32
 	LinesBlamed  int64
 	ErrorMessage string
 }
@@ -100,6 +102,7 @@ type Metrics struct {
 	linesProcessed atomic.Int64
 	errors         atomic.Int64
 	reposProcessed atomic.Int64
+	filesSkipped   atomic.Int64 // Files skipped due to timeout or other issues
 }
 
 var metrics Metrics
@@ -450,6 +453,9 @@ func main() {
 	fmt.Println("=== Analysis Complete ===")
 	fmt.Printf("Successfully processed %d/%d repositories (%d errors)\n",
 		successCount, len(repos), errorCount)
+	if metrics.filesSkipped.Load() > 0 {
+		fmt.Printf("Files skipped due to timeout: %d\n", metrics.filesSkipped.Load())
+	}
 	fmt.Println()
 	generateSummary(db)
 }
@@ -572,6 +578,7 @@ func processRepository(repo RepoInfo, blameWorkers int, progressChan chan<- Repo
 	// Track progress for this repo
 	var filesBlamed atomic.Int64
 	var linesBlamed atomic.Int64
+	var filesSkipped atomic.Int64
 
 	// Progress reporter goroutine
 	progressDone := make(chan struct{})
@@ -584,11 +591,12 @@ func processRepository(repo RepoInfo, blameWorkers int, progressChan chan<- Repo
 			select {
 			case <-ticker.C:
 				progressChan <- RepoProgress{
-					Name:        repo.Name,
-					Status:      "blaming",
-					FilesTotal:  int32(totalFiles),
-					FilesBlamed: int32(filesBlamed.Load()),
-					LinesBlamed: linesBlamed.Load(),
+					Name:         repo.Name,
+					Status:       "blaming",
+					FilesTotal:   int32(totalFiles),
+					FilesBlamed:  int32(filesBlamed.Load()),
+					FilesSkipped: int32(filesSkipped.Load()),
+					LinesBlamed:  linesBlamed.Load(),
 				}
 			case <-ctx.Done():
 				return
@@ -600,7 +608,7 @@ func processRepository(repo RepoInfo, blameWorkers int, progressChan chan<- Repo
 	var blameWg sync.WaitGroup
 	for i := 0; i < blameWorkers; i++ {
 		blameWg.Add(1)
-		go blameWorker(ctx, repo.Path, repoID, fileTaskChan, fileStatsChan, &filesBlamed, &linesBlamed, &blameWg)
+		go blameWorker(ctx, repo.Path, repoID, fileTaskChan, fileStatsChan, &filesBlamed, &linesBlamed, &filesSkipped, &blameWg)
 	}
 
 	// Fan out files to workers
@@ -639,11 +647,12 @@ func processRepository(repo RepoInfo, blameWorkers int, progressChan chan<- Repo
 
 	// Update status: done
 	progressChan <- RepoProgress{
-		Name:        repo.Name,
-		Status:      "done",
-		FilesTotal:  int32(totalFiles),
-		FilesBlamed: int32(totalFiles),
-		LinesBlamed: linesBlamed.Load(),
+		Name:         repo.Name,
+		Status:       "done",
+		FilesTotal:   int32(totalFiles),
+		FilesBlamed:  int32(totalFiles),
+		FilesSkipped: int32(filesSkipped.Load()),
+		LinesBlamed:  linesBlamed.Load(),
 	}
 
 	return nil
@@ -861,7 +870,7 @@ func parseGitBlamePorcelain(scanner *bufio.Scanner) map[string]int {
 // Uses streaming to avoid buffering entire git blame output in memory
 func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks <-chan FileTask,
 	stats chan<- FileAuthorStats, filesBlamed *atomic.Int64, linesBlamed *atomic.Int64,
-	wg *sync.WaitGroup) {
+	filesSkipped *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for task := range fileTasks {
@@ -871,14 +880,19 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 		default:
 		}
 
+		// Create a timeout context for this specific git blame operation
+		blameCtx, cancel := context.WithTimeout(ctx, gitBlameTimeout)
+		defer cancel()
+
 		// Run git blame with porcelain format, streaming output
-		cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "blame", "--line-porcelain", "-w", "HEAD", "--", task.FilePath)
+		cmd := exec.CommandContext(blameCtx, "git", "-C", repoPath, "blame", "--line-porcelain", "-w", "HEAD", "--", task.FilePath)
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			metrics.errors.Add(1)
 			metrics.filesProcessed.Add(1)
 			filesBlamed.Add(1)
+			cancel()
 			continue
 		}
 
@@ -886,6 +900,7 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 			metrics.errors.Add(1)
 			metrics.filesProcessed.Add(1)
 			filesBlamed.Add(1)
+			cancel()
 			continue
 		}
 
@@ -895,10 +910,23 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 		authorCounts := parseGitBlamePorcelain(scanner)
 
 		if err := cmd.Wait(); err != nil {
-			// Skip files that can't be blamed
-			metrics.errors.Add(1)
-			metrics.filesProcessed.Add(1)
-			filesBlamed.Add(1)
+			// Check if the error is due to timeout
+			if blameCtx.Err() == context.DeadlineExceeded {
+				// File timed out - skip it
+				metrics.filesSkipped.Add(1)
+				metrics.filesProcessed.Add(1)
+				filesBlamed.Add(1)
+				filesSkipped.Add(1)
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Warning: git blame timed out after %v for file: %s\n", gitBlameTimeout, task.FilePath)
+				}
+			} else {
+				// Other error - skip file
+				metrics.errors.Add(1)
+				metrics.filesProcessed.Add(1)
+				filesBlamed.Add(1)
+			}
+			cancel()
 			continue
 		}
 
@@ -916,6 +944,7 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 			case stats <- stat:
 				totalLines += count
 			case <-ctx.Done():
+				cancel()
 				return
 			}
 		}
@@ -924,6 +953,7 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 		metrics.filesProcessed.Add(1)
 		filesBlamed.Add(1)
 		linesBlamed.Add(int64(totalLines))
+		cancel()
 	}
 }
 
@@ -1120,8 +1150,8 @@ func progressUI(progressChan <-chan RepoProgress, done chan<- struct{}) {
 		// Header (extended width for large numbers)
 		fmt.Printf("┌─ Git Who  ────────────────────────────────────────────────────────────────────────────────────────────────────┐\n")
 		lines++
-		fmt.Printf("│ Runtime: %s | Active: %d | Done: %d | Queued: %d | Errors: %d | Files: %d | Lines: %d     \n",
-			runtime, active, completedCount, queued, erroredCount, metrics.filesProcessed.Load(), metrics.linesProcessed.Load())
+		fmt.Printf("│ Runtime: %s | Active: %d | Done: %d | Queued: %d | Errors: %d | Skipped: %d | Files: %d | Lines: %d     \n",
+			runtime, active, completedCount, queued, erroredCount, metrics.filesSkipped.Load(), metrics.filesProcessed.Load(), metrics.linesProcessed.Load())
 		lines++
 		fmt.Printf("└───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n")
 		lines++
@@ -1291,7 +1321,11 @@ func renderRepoLine(p *RepoProgress) int {
 		color = "\033[36m" // Cyan
 	case "blaming":
 		statusIcon = statusIconBlaming
-		statusText = fmt.Sprintf("Blaming %d/%d files", p.FilesBlamed, p.FilesTotal)
+		if p.FilesSkipped > 0 {
+			statusText = fmt.Sprintf("Blaming %d/%d files (%d skipped)", p.FilesBlamed, p.FilesTotal, p.FilesSkipped)
+		} else {
+			statusText = fmt.Sprintf("Blaming %d/%d files", p.FilesBlamed, p.FilesTotal)
+		}
 		color = "\033[33m" // Yellow
 	case "commits":
 		statusIcon = statusIconCommits
@@ -1299,7 +1333,11 @@ func renderRepoLine(p *RepoProgress) int {
 		color = "\033[35m" // Magenta
 	case "done":
 		statusIcon = statusIconDone
-		statusText = fmt.Sprintf("Complete (%d files, %d lines)", p.FilesTotal, p.LinesBlamed)
+		if p.FilesSkipped > 0 {
+			statusText = fmt.Sprintf("Complete (%d files, %d lines, %d skipped)", p.FilesTotal, p.LinesBlamed, p.FilesSkipped)
+		} else {
+			statusText = fmt.Sprintf("Complete (%d files, %d lines)", p.FilesTotal, p.LinesBlamed)
+		}
 		color = "\033[32m" // Green
 	case "error":
 		statusIcon = statusIconError
