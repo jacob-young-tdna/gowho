@@ -104,13 +104,16 @@ type Metrics struct {
 
 var metrics Metrics
 
+// Global verbose flag
+var verbose bool
+
 // RepoIntern handles string interning for repository paths
 // Replaces 16-byte string pointers with 2-byte uint16 IDs
 type RepoIntern struct {
-	mu         sync.RWMutex
-	pathToID   map[string]uint16
-	idToPath   []string
-	nextID     uint16
+	mu       sync.RWMutex
+	pathToID map[string]uint16
+	idToPath []string
+	nextID   uint16
 }
 
 func newRepoIntern() *RepoIntern {
@@ -237,7 +240,9 @@ func findGitRepos(path string) ([]RepoInfo, error) {
 		return nil, fmt.Errorf("failed to get absolute path: %w", err)
 	}
 
-	fmt.Printf("Recursively scanning for git repositories in: %s\n", absPath)
+	if verbose {
+		fmt.Printf("Recursively scanning for git repositories in: %s\n", absPath)
+	}
 	startTime := time.Now()
 
 	// Channel for found repositories
@@ -272,10 +277,12 @@ func findGitRepos(path string) ([]RepoInfo, error) {
 	// Wait for collector to finish
 	collectorWg.Wait()
 
-	elapsed := time.Since(startTime)
-	fmt.Printf("Found %d git repositories in %.2fs (using %d concurrent workers)\n",
-		len(repos), elapsed.Seconds(), maxConcurrent)
-	fmt.Println()
+	if verbose {
+		elapsed := time.Since(startTime)
+		fmt.Printf("Found %d git repositories in %.2fs (using %d concurrent workers)\n",
+			len(repos), elapsed.Seconds(), maxConcurrent)
+		fmt.Println()
+	}
 
 	if len(repos) == 0 {
 		return nil, fmt.Errorf("no git repositories found in %s", absPath)
@@ -285,8 +292,21 @@ func findGitRepos(path string) ([]RepoInfo, error) {
 }
 
 func main() {
-	fmt.Println("=== Git Who - Repository Contribution Analyzer (Optimized Go Edition) ===")
-	fmt.Println()
+	// Parse command line arguments
+	targetPath := "."
+	for i := 1; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		if arg == "-v" || arg == "--verbose" {
+			verbose = true
+		} else if !strings.HasPrefix(arg, "-") {
+			targetPath = arg
+		}
+	}
+
+	if verbose {
+		fmt.Println("=== Git Who - Repository Contribution Analyzer (Optimized Go Edition) ===")
+		fmt.Println()
+	}
 
 	// Tune GC for lower memory usage
 	// GCPercent=50 triggers GC more frequently, reducing peak memory at cost of ~5% CPU
@@ -295,13 +315,9 @@ func main() {
 	// Set soft memory limit to 4GB to prevent runaway memory growth
 	debug.SetMemoryLimit(4 * 1024 * 1024 * 1024)
 
-	fmt.Println("Memory optimizations: GC=50%, Limit=4GB, Streaming I/O, Interned paths")
-	fmt.Println()
-
-	// Parse command line arguments
-	targetPath := "."
-	if len(os.Args) > 1 {
-		targetPath = os.Args[1]
+	if verbose {
+		fmt.Println("Memory optimizations: GC=50%, Limit=4GB, Streaming I/O, Interned paths")
+		fmt.Println()
 	}
 
 	// Find git repositories
@@ -311,21 +327,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Found %d git repository(ies) to analyze\n", len(repos))
-	for _, repo := range repos {
-		fmt.Printf("  - %s (%s)\n", repo.Name, repo.Path)
+	if verbose {
+		fmt.Printf("Found %d git repository(ies) to analyze\n", len(repos))
+		for _, repo := range repos {
+			fmt.Printf("  - %s (%s)\n", repo.Name, repo.Path)
+		}
+		fmt.Println()
 	}
-	fmt.Println()
 
 	// Pre-flight: count files and sort by size (smallest first)
 	repos = preflightCountFiles(repos)
 
-	// Display optimized processing order
-	fmt.Println("Optimized processing order (smallest to largest):")
-	for i, repo := range repos {
-		fmt.Printf("  %2d. %-30s (%d files)\n", i+1, repo.Name, repo.FileCount)
+	if verbose {
+		// Display optimized processing order
+		fmt.Println("Optimized processing order (smallest to largest):")
+		for i, repo := range repos {
+			fmt.Printf("  %2d. %-30s (%d files)\n", i+1, repo.Name, repo.FileCount)
+		}
+		fmt.Println()
 	}
-	fmt.Println()
 
 	// Create shared database
 	db, err := createDatabase()
@@ -347,9 +367,11 @@ func main() {
 	if repoWorkers > 4 {
 		repoWorkers = 4
 	}
-	fmt.Printf("Using %d CPU cores with %d repo workers and %d blame workers per repo\n",
-		numCPU, repoWorkers, blameWorkers)
-	fmt.Println()
+	if verbose {
+		fmt.Printf("Using %d CPU cores with %d repo workers and %d blame workers per repo\n",
+			numCPU, repoWorkers, blameWorkers)
+		fmt.Println()
+	}
 
 	// Create CSP channels
 	repoTasks := make(chan RepoInfo, repoTaskBuffer)
@@ -629,7 +651,9 @@ func processRepository(repo RepoInfo, blameWorkers int, progressChan chan<- Repo
 
 // createDatabase creates the SQLite database with optimized schema
 func createDatabase() (*sql.DB, error) {
-	fmt.Printf("Creating database: %s\n", dbFile)
+	if verbose {
+		fmt.Printf("Creating database: %s\n", dbFile)
+	}
 
 	// Remove existing database
 	os.Remove(dbFile)
@@ -742,7 +766,9 @@ func countFilesInRepo(repo RepoInfo) (RepoInfo, error) {
 
 // preflightCountFiles counts files in all repositories in parallel and sorts them
 func preflightCountFiles(repos []RepoInfo) []RepoInfo {
-	fmt.Println("Pre-flight: Counting files in each repository to optimize processing order...")
+	if verbose {
+		fmt.Println("Pre-flight: Counting files in each repository to optimize processing order...")
+	}
 	startTime := time.Now()
 
 	type countResult struct {
@@ -787,15 +813,17 @@ func preflightCountFiles(repos []RepoInfo) []RepoInfo {
 		return countedRepos[i].FileCount < countedRepos[j].FileCount
 	})
 
-	elapsed := time.Since(startTime)
-	totalFiles := 0
-	for _, repo := range countedRepos {
-		totalFiles += repo.FileCount
-	}
+	if verbose {
+		elapsed := time.Since(startTime)
+		totalFiles := 0
+		for _, repo := range countedRepos {
+			totalFiles += repo.FileCount
+		}
 
-	fmt.Printf("Pre-flight complete: %d repositories, %d total files (%.2fs)\n",
-		len(countedRepos), totalFiles, elapsed.Seconds())
-	fmt.Println()
+		fmt.Printf("Pre-flight complete: %d repositories, %d total files (%.2fs)\n",
+			len(countedRepos), totalFiles, elapsed.Seconds())
+		fmt.Println()
+	}
 
 	return countedRepos
 }
@@ -1040,33 +1068,6 @@ func writeBatch(db *sql.DB, batch []FileAuthorStats) error {
 	return tx.Commit()
 }
 
-// progressReporter displays progress every second
-func progressReporter(totalFiles int, stop <-chan struct{}) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	start := time.Now()
-
-	for {
-		select {
-		case <-ticker.C:
-			files := metrics.filesProcessed.Load()
-			lines := metrics.linesProcessed.Load()
-			errors := metrics.errors.Load()
-
-			elapsed := time.Since(start)
-			rate := float64(files) / elapsed.Seconds()
-
-			fmt.Printf("\rProgress: %d/%d files | %d lines | %.1f files/s | errors: %d",
-				files, totalFiles, lines, rate, errors)
-
-		case <-stop:
-			fmt.Println()
-			return
-		}
-	}
-}
-
 // progressUI manages the terminal UI for multi-repo progress tracking
 func progressUI(progressChan <-chan RepoProgress, done chan<- struct{}) {
 	defer close(done)
@@ -1117,12 +1118,12 @@ func progressUI(progressChan <-chan RepoProgress, done chan<- struct{}) {
 		runtime := fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
 
 		// Header (extended width for large numbers)
-		fmt.Printf("┌─ Git Who - Multi-Repository Analysis ─────────────────────────────────────────────────────────────────────────┐\n")
+		fmt.Printf("┌─ Git Who  ────────────────────────────────────────────────────────────────────────────────────────────────────┐\n")
 		lines++
 		fmt.Printf("│ Runtime: %s | Active: %d | Done: %d | Queued: %d | Errors: %d | Files: %d | Lines: %d     \n",
 			runtime, active, completedCount, queued, erroredCount, metrics.filesProcessed.Load(), metrics.linesProcessed.Load())
 		lines++
-		fmt.Printf("└────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n")
+		fmt.Printf("└───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘\n")
 		lines++
 		fmt.Println()
 		lines++
