@@ -614,6 +614,40 @@ func findGitRepos(path string) ([]RepoInfo, error) {
 	return repos, nil
 }
 
+func printHelp() {
+	fmt.Println("gowho - Git repository contribution analyzer")
+	fmt.Println()
+	fmt.Println("USAGE:")
+	fmt.Println("  gowho [OPTIONS] [PATH]")
+	fmt.Println()
+	fmt.Println("DESCRIPTION:")
+	fmt.Println("  Analyzes git repositories to determine code ownership by running")
+	fmt.Println("  git-blame on all tracked files and analyzing commit history.")
+	fmt.Println("  Results are stored in a SQLite database (git-who.db).")
+	fmt.Println()
+	fmt.Println("OPTIONS:")
+	fmt.Println("  -h, --help              Show this help message")
+	fmt.Println("  -v, --verbose           Enable verbose output")
+	fmt.Println("  -L, --file-list=MODE    File listing mode: git or fs (default: git)")
+	fmt.Println("                            git: Use git ls-tree (tracked files only)")
+	fmt.Println("                            fs:  Use filesystem walker (respects .gitignore)")
+	fmt.Println()
+	fmt.Println("ARGUMENTS:")
+	fmt.Println("  PATH                    Directory to scan for git repositories (default: .)")
+	fmt.Println()
+	fmt.Println("EXAMPLES:")
+	fmt.Println("  gowho                   Analyze current directory")
+	fmt.Println("  gowho ~/projects        Analyze all repos in ~/projects")
+	fmt.Println("  gowho -v .              Verbose output for current directory")
+	fmt.Println("  gowho --file-list=fs .  Use filesystem walker instead of git ls-tree")
+	fmt.Println()
+	fmt.Println("OUTPUT:")
+	fmt.Println("  Creates git-who.db with two tables:")
+	fmt.Println("    - file_author: Line counts per author per file")
+	fmt.Println("    - author_commit_stats: Commit activity over 3/6/12 month periods")
+	fmt.Println()
+}
+
 func main() {
 	// Parse command line arguments
 	targetPath := "."
@@ -622,6 +656,9 @@ func main() {
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
 		switch {
+		case arg == "-h" || arg == "--help":
+			printHelp()
+			os.Exit(0)
 		case arg == "-v" || arg == "--verbose":
 			verbose = true
 		case strings.HasPrefix(arg, "--file-list="):
