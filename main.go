@@ -172,9 +172,10 @@ type FileAuthorStats struct {
 }
 
 // CommitStatsBatch represents a batch of commit stats for database writing
+// Uses AuthorID map key instead of author string for memory efficiency
 type CommitStatsBatch struct {
-	RepoID uint16 // Interned repository ID
-	Stats  map[string]*CommitStats
+	RepoID uint16                  // Interned repository ID
+	Stats  map[uint32]*CommitStats // Map keyed by interned AuthorID
 }
 
 // CommitStats represents commit activity in time buckets
