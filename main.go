@@ -55,6 +55,7 @@ const (
 // Capacity Hints: Pre-allocation for Memory Efficiency
 const (
 	repoInternCapacity   = 2000 // Expected number of repositories for string interning
+	authorInternCapacity = 1024 // Expected unique authors across all repositories for interning
 	authorCountsCapacity = 32   // Expected authors per file
 	commitStatsCapacity  = 256  // Expected unique authors in commit history
 	fileListCapacity     = 1024 // Initial capacity for file lists
@@ -284,6 +285,60 @@ func (r *RepoIntern) Lookup(id uint16) string {
 }
 
 var repoIntern = newRepoIntern()
+
+// AuthorIntern handles string interning for author emails
+// Replaces 16-byte string pointers with 4-byte uint32 IDs
+// Uses double-checked locking for thread-safe interning
+type AuthorIntern struct {
+	mu        sync.RWMutex
+	emailToID map[string]uint32
+	idToEmail []string
+	nextID    uint32
+}
+
+func newAuthorIntern() *AuthorIntern {
+	return &AuthorIntern{
+		emailToID: make(map[string]uint32, authorInternCapacity),
+		idToEmail: make([]string, 0, authorInternCapacity),
+	}
+}
+
+func (a *AuthorIntern) Intern(email string) uint32 {
+	// Fast path: read lock for existing emails
+	a.mu.RLock()
+	if id, exists := a.emailToID[email]; exists {
+		a.mu.RUnlock()
+		return id
+	}
+	a.mu.RUnlock()
+
+	// Slow path: write lock to add new email
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Double-check after acquiring write lock (race condition between locks)
+	if id, exists := a.emailToID[email]; exists {
+		return id
+	}
+
+	// Assign new ID
+	id := a.nextID
+	a.nextID++
+	a.emailToID[email] = id
+	a.idToEmail = append(a.idToEmail, email)
+	return id
+}
+
+func (a *AuthorIntern) Lookup(id uint32) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if int(id) < len(a.idToEmail) {
+		return a.idToEmail[id]
+	}
+	return ""
+}
+
+var authorIntern = newAuthorIntern()
 
 // RepoInfo represents a git repository to process
 type RepoInfo struct {
