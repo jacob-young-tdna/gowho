@@ -48,11 +48,13 @@ const (
 )
 
 // Channel Buffers: CSP Communication
+// Increased buffer sizes reduce goroutine blocking and context switch overhead (Phase 3 optimization)
+// Larger buffers allow producers and consumers to run more independently, reducing synchronization cost
 const (
-	fileTaskBuffer         = 500  // Buffer size for file blame tasks within a repo
-	contributionBuffer     = 1000 // Buffer size for file author stats aggregation
+	fileTaskBuffer         = 2000 // Buffer size for file blame tasks within a repo (4x increase for reduced blocking)
+	contributionBuffer     = 5000 // Buffer size for file author stats aggregation (5x increase for reduced blocking)
 	repoTaskBuffer         = 50   // Buffer size for repository tasks
-	commitStatsBuffer      = 100  // Buffer size for commit statistics batches
+	commitStatsBuffer      = 500  // Buffer size for commit statistics batches (5x increase for reduced blocking)
 	repoScanBuffer         = 100  // Buffer size for discovered repos during scanning
 	progressChanDefault    = 1000 // Default progress channel buffer size
 	progressChanThreshold  = 100  // Repo count threshold for smaller progress buffer
