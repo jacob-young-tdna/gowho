@@ -1303,9 +1303,10 @@ func writeBatch(db *sql.DB, batch []FileAuthorStats) error {
 		}
 		sb.WriteString("(?,?,?,?)")
 
-		// Convert RepoID back to path for database
+		// Convert RepoID and AuthorID back to strings for database
 		repoPath := repoIntern.Lookup(batch[i].RepoID)
-		args = append(args, repoPath, batch[i].FilePath, batch[i].Author, batch[i].Lines)
+		author := authorIntern.Lookup(batch[i].AuthorID)
+		args = append(args, repoPath, batch[i].FilePath, author, batch[i].Lines)
 	}
 
 	_, err = tx.Exec(sb.String(), args...)
