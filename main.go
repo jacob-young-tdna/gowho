@@ -1131,14 +1131,15 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 			continue
 		}
 
-		// Emit aggregated stats using RepoID instead of RepoPath string
+		// Emit aggregated stats with interned AuthorID
 		totalLines := 0
-		for author, count := range authorCounts {
+		for authorID, count := range authorCounts {
 			stat := FileAuthorStats{
-				RepoID:   repoID,
 				FilePath: task.FilePath,
-				Author:   author,
+				AuthorID: authorID,
 				Lines:    int32(count),
+				RepoID:   repoID,
+				Flags:    0,
 			}
 
 			select {
