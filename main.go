@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,11 @@ import (
 // Performance Tuning Constants
 // All performance-sensitive parameters are extracted here for easy tuning.
 // These values control parallelism, memory usage, buffering, and timeouts.
+
+// CLI Args
+const (
+	fileListModeDefault = "git"
+)
 
 // Memory Management
 const (
@@ -374,6 +380,99 @@ func getCodeExtensions() []string {
 	return extensions
 }
 
+// FileLister abstracts how we enumerate code files for blame
+type FileLister interface {
+	List(repoPath string) ([]string, error)
+	Count(repoPath string) (int, error)
+}
+
+// GitLsTreeLister uses git ls-tree to enumerate files at HEAD
+// This is faster than filesystem walking and only includes tracked files
+type GitLsTreeLister struct{}
+
+func (GitLsTreeLister) List(repoPath string) ([]string, error) {
+	cmd := exec.Command("git", "-C", repoPath, "ls-tree", "-r", "-z", "--name-only", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		// For unborn HEAD, treat as empty
+		return []string{}, nil
+	}
+
+	raw := bytes.Split(out, []byte{0})
+	files := make([]string, 0, len(raw))
+	for _, b := range raw {
+		if len(b) == 0 {
+			continue
+		}
+		p := string(b)
+		if textExtensions[strings.ToLower(filepath.Ext(p))] {
+			files = append(files, p)
+		}
+	}
+	return files, nil
+}
+
+func (GitLsTreeLister) Count(repoPath string) (int, error) {
+	cmd := exec.Command("git", "-C", repoPath, "ls-tree", "-r", "-z", "--name-only", "HEAD")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, err
+	}
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+
+	buf := make([]byte, 64*1024)
+	leftover := []byte{}
+	count := 0
+
+	for {
+		n, er := stdout.Read(buf)
+		if n > 0 {
+			chunk := append(leftover, buf[:n]...)
+			parts := bytes.Split(chunk, []byte{0})
+			leftover = parts[len(parts)-1]
+			for _, part := range parts[:len(parts)-1] {
+				if len(part) == 0 {
+					continue
+				}
+				p := string(part)
+				if textExtensions[strings.ToLower(filepath.Ext(p))] {
+					count++
+				}
+			}
+		}
+		if er == io.EOF {
+			break
+		}
+		if er != nil {
+			_ = cmd.Wait()
+			return 0, er
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// FSWalkerLister uses gocodewalker (filesystem walk) to enumerate files
+// This respects .gitignore and may include untracked files
+type FSWalkerLister struct{}
+
+func (FSWalkerLister) List(repoPath string) ([]string, error) {
+	return getFilesAtHEAD(repoPath)
+}
+
+func (FSWalkerLister) Count(repoPath string) (int, error) {
+	ri := RepoInfo{Path: repoPath}
+	counted, err := countFilesInRepo(ri)
+	if err != nil {
+		return 0, err
+	}
+	return counted.FileCount, nil
+}
+
 // isGitRepo checks if a directory is a git repository
 func isGitRepo(path string) bool {
 	gitDir := filepath.Join(path, ".git")
@@ -478,18 +577,47 @@ func findGitRepos(path string) ([]RepoInfo, error) {
 func main() {
 	// Parse command line arguments
 	targetPath := "."
+	fileListMode := fileListModeDefault
+
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
-		if arg == "-v" || arg == "--verbose" {
+		switch {
+		case arg == "-v" || arg == "--verbose":
 			verbose = true
-		} else if !strings.HasPrefix(arg, "-") {
-			targetPath = arg
+		case strings.HasPrefix(arg, "--file-list="):
+			v := strings.TrimPrefix(arg, "--file-list=")
+			if v != "git" && v != "fs" {
+				fmt.Fprintf(os.Stderr, "Unknown --file-list=%s (use git|fs)\n", v)
+				os.Exit(2)
+			}
+			fileListMode = v
+		case arg == "-L" && i+1 < len(os.Args):
+			i++
+			v := os.Args[i]
+			if v != "git" && v != "fs" {
+				fmt.Fprintf(os.Stderr, "Unknown -L %s (use git|fs)\n", v)
+				os.Exit(2)
+			}
+			fileListMode = v
+		default:
+			if !strings.HasPrefix(arg, "-") {
+				targetPath = arg
+			}
 		}
+	}
+
+	var fileLister FileLister
+	switch fileListMode {
+	case "git":
+		fileLister = GitLsTreeLister{}
+	case "fs":
+		fileLister = FSWalkerLister{}
 	}
 
 	if verbose {
 		fmt.Println("=== Git Who - Repository Contribution Analyzer (Optimized Go Edition) ===")
 		fmt.Println()
+		fmt.Printf("File listing mode: %s\n\n", fileListMode)
 	}
 
 	// Tune GC for lower memory usage
@@ -519,7 +647,7 @@ func main() {
 	}
 
 	// Pre-flight: count files and sort by size (smallest first)
-	repos = preflightCountFiles(repos)
+	repos = preflightCountFiles(repos, fileLister)
 
 	if verbose {
 		// Display optimized processing order
@@ -589,7 +717,7 @@ func main() {
 	var repoWg sync.WaitGroup
 	for i := 0; i < repoWorkers; i++ {
 		repoWg.Add(1)
-		go repoWorker(blameWorkers, repoTasks, repoResults, progressChan, fileStatsChan, commitStatsChan, &repoWg)
+		go repoWorker(blameWorkers, repoTasks, repoResults, progressChan, fileStatsChan, commitStatsChan, fileLister, &repoWg)
 	}
 
 	// Feed repositories to workers
@@ -706,7 +834,8 @@ func centralizedDatabaseWriter(db *sql.DB, fileStats <-chan FileAuthorStats,
 
 // processRepository analyzes a single git repository
 func processRepository(repo RepoInfo, blameWorkers int, progressChan chan<- RepoProgress,
-	fileStatsChan chan<- FileAuthorStats, commitStatsChan chan<- CommitStatsBatch) error {
+	fileStatsChan chan<- FileAuthorStats, commitStatsChan chan<- CommitStatsBatch,
+	fileLister FileLister) error {
 
 	// Intern the repository path once at the start
 	repoID := repoIntern.Intern(repo.Path)
@@ -717,8 +846,8 @@ func processRepository(repo RepoInfo, blameWorkers int, progressChan chan<- Repo
 		Status: StatusDiscovering,
 	}
 
-	// Get file list from HEAD
-	files, err := getFilesAtHEAD(repo.Path)
+	// Get file list using the configured lister
+	files, err := fileLister.List(repo.Path)
 	if err != nil {
 		progressChan <- RepoProgress{
 			Name:         repo.Name,
@@ -974,7 +1103,7 @@ func countFilesInRepo(repo RepoInfo) (RepoInfo, error) {
 }
 
 // preflightCountFiles counts files in all repositories in parallel and sorts them
-func preflightCountFiles(repos []RepoInfo) []RepoInfo {
+func preflightCountFiles(repos []RepoInfo, fileLister FileLister) []RepoInfo {
 	if verbose {
 		fmt.Println("Pre-flight: Counting files in each repository to optimize processing order...")
 	}
@@ -999,8 +1128,13 @@ func preflightCountFiles(repos []RepoInfo) []RepoInfo {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			counted, err := countFilesInRepo(r)
-			results <- countResult{repo: counted, err: err}
+			count, err := fileLister.Count(r.Path)
+			if err != nil {
+				results <- countResult{repo: r, err: err}
+				return
+			}
+			r.FileCount = count
+			results <- countResult{repo: r, err: nil}
 		}(repo)
 	}
 
@@ -1600,11 +1734,11 @@ func renderRepoLine(p *RepoProgress) int {
 func repoWorker(blameWorkers int, repoTasks <-chan RepoInfo,
 	results chan<- RepoResult, progressChan chan<- RepoProgress,
 	fileStatsChan chan<- FileAuthorStats, commitStatsChan chan<- CommitStatsBatch,
-	wg *sync.WaitGroup) {
+	fileLister FileLister, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for repo := range repoTasks {
-		err := processRepository(repo, blameWorkers, progressChan, fileStatsChan, commitStatsChan)
+		err := processRepository(repo, blameWorkers, progressChan, fileStatsChan, commitStatsChan, fileLister)
 
 		result := RepoResult{
 			RepoName: repo.Name,
