@@ -1182,7 +1182,8 @@ func processCommitStats(repoPath string, repoID uint16, commitStatsChan chan<- C
 	}
 
 	// Aggregate commits by author and time bucket in memory
-	commitStats := make(map[string]*CommitStats, commitStatsCapacity)
+	// Use AuthorID map key for memory efficiency
+	commitStats := make(map[uint32]*CommitStats, commitStatsCapacity)
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, scannerBufferSize), scannerMaxLine)
@@ -1200,13 +1201,14 @@ func processCommitStats(repoPath string, repoID uint16, commitStatsChan chan<- C
 		}
 
 		author := parts[1]
+		authorID := authorIntern.Intern(author)
 		parents := parts[2]
 
 		// Initialize stats if needed
-		stats, exists := commitStats[author]
+		stats, exists := commitStats[authorID]
 		if !exists {
-			stats = &CommitStats{Author: author}
-			commitStats[author] = stats
+			stats = &CommitStats{AuthorID: authorID}
+			commitStats[authorID] = stats
 		}
 
 		// Determine time bucket
