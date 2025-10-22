@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/boyter/gocodewalker"
 	_ "modernc.org/sqlite"
@@ -354,6 +355,26 @@ func (a *AuthorIntern) Intern(email string) uint32 {
 	a.emailToID[email] = id
 	a.idToEmail = append(a.idToEmail, email)
 	return id
+}
+
+// InternBytes interns a byte slice as a string without allocating unless necessary
+// Uses zero-copy string conversion for lookup (Go 1.20+)
+// Only allocates if the email is not already interned
+func (a *AuthorIntern) InternBytes(email []byte) uint32 {
+	// Fast path: read lock with zero-copy string conversion
+	a.mu.RLock()
+	// Zero-copy conversion using unsafe (Go 1.20+)
+	// This does NOT allocate but string must not be modified
+	emailStr := unsafe.String(unsafe.SliceData(email), len(email))
+	if id, exists := a.emailToID[emailStr]; exists {
+		a.mu.RUnlock()
+		return id
+	}
+	a.mu.RUnlock()
+
+	// Slow path: allocate proper string for storage
+	emailStrCopy := string(email)
+	return a.Intern(emailStrCopy)
 }
 
 func (a *AuthorIntern) Lookup(id uint32) string {
@@ -1204,8 +1225,8 @@ func parseGitBlamePorcelain(scanner *bufio.Scanner, authorCounts map[uint32]int)
 			// Extract email, removing angle brackets
 			email := line[12:] // Skip "author-mail "
 			if len(email) > 2 && email[0] == '<' && email[len(email)-1] == '>' {
-				emailStr := string(email[1 : len(email)-1])
-				currentAuthorID = authorIntern.Intern(emailStr)
+				emailBytes := email[1 : len(email)-1]
+				currentAuthorID = authorIntern.InternBytes(emailBytes)
 			}
 		} else if len(line) > 0 && line[0] == '\t' {
 			// Tab-prefixed lines are actual content lines
