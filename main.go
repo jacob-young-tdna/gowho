@@ -179,12 +179,14 @@ type CommitStatsBatch struct {
 
 // CommitStats represents commit activity in time buckets
 // Uses int32 for counts to reduce memory (4 bytes vs 8 bytes per field)
+// Uses AuthorID instead of Author string for memory efficiency (4 bytes vs 16 bytes)
+// Size: 20 bytes (reduced from 32 bytes via author interning, 37.5% reduction)
 type CommitStats struct {
-	Author     string
-	Commits3M  int32
-	Commits6M  int32
-	Commits12M int32
-	Merges     int32
+	AuthorID   uint32 // 4 bytes [0-3]
+	Commits3M  int32  // 4 bytes [4-7]
+	Commits6M  int32  // 4 bytes [8-11]
+	Commits12M int32  // 4 bytes [12-15]
+	Merges     int32  // 4 bytes [16-19]
 }
 
 // RepoResult represents the outcome of processing a repository
