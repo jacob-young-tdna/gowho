@@ -1246,7 +1246,8 @@ func processCommitStats(repoPath string, repoID uint16, commitStatsChan chan<- C
 }
 
 // writeCommitStatsBatch writes commit statistics using optimized multi-row INSERT
-func writeCommitStatsBatch(db *sql.DB, repoPath string, stats map[string]*CommitStats) error {
+// Lookups author strings from AuthorID for database storage
+func writeCommitStatsBatch(db *sql.DB, repoPath string, stats map[uint32]*CommitStats) error {
 	if len(stats) == 0 {
 		return nil
 	}
@@ -1264,13 +1265,15 @@ func writeCommitStatsBatch(db *sql.DB, repoPath string, stats map[string]*Commit
 
 	args := make([]interface{}, 0, len(stats)*6)
 	first := true
-	for _, stat := range stats {
+	for authorID, stat := range stats {
 		if !first {
 			sb.WriteString(",")
 		}
 		first = false
 		sb.WriteString("(?,?,?,?,?,?)")
-		args = append(args, repoPath, stat.Author, stat.Commits3M, stat.Commits6M, stat.Commits12M, stat.Merges)
+		// Lookup author string for database
+		author := authorIntern.Lookup(authorID)
+		args = append(args, repoPath, author, stat.Commits3M, stat.Commits6M, stat.Commits12M, stat.Merges)
 	}
 
 	_, err = tx.Exec(sb.String(), args...)
