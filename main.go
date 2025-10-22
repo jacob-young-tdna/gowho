@@ -160,14 +160,15 @@ type FileTask struct {
 
 // FileAuthorStats represents aggregated blame counts for a file
 // Uses RepoID instead of RepoPath string for memory efficiency (2 bytes vs 16 bytes)
+// Uses AuthorID instead of Author string for memory efficiency (4 bytes vs 16 bytes)
 // Fields ordered for optimal cache alignment: large → small
-// Size: 40 bytes (reduced from 48 bytes with padding waste)
+// Size: 28 bytes (reduced from 40 bytes via author interning, 30% reduction)
 type FileAuthorStats struct {
 	FilePath string // 16 bytes [0-15]
-	Author   string // 16 bytes [16-31]
-	Lines    int32  // 4 bytes [32-35]
-	RepoID   uint16 // 2 bytes [36-37]
-	Flags    uint16 // 2 bytes [38-39] (reserved for future use)
+	AuthorID uint32 // 4 bytes [16-19]
+	Lines    int32  // 4 bytes [20-23]
+	RepoID   uint16 // 2 bytes [24-25]
+	Flags    uint16 // 2 bytes [26-27]
 }
 
 // CommitStatsBatch represents a batch of commit stats for database writing
