@@ -1,7 +1,6 @@
 gowho
-gowho-optimized
-git-who.sh
-git-who.db
+gowho-*
+git-who.*
 
 
 # Binaries for programs and plugins

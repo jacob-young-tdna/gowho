@@ -21,15 +21,90 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Configuration constants
+// Performance Tuning Constants
+// All performance-sensitive parameters are extracted here for easy tuning.
+// These values control parallelism, memory usage, buffering, and timeouts.
+
+// Memory Management
 const (
+	gcPercent   = 50                     // GC trigger percentage (lower = more frequent GC, less memory)
+	memoryLimit = 4 * 1024 * 1024 * 1024 // Soft memory limit in bytes (4GB)
+)
+
+// Parallelism: Worker Pool Configuration
+const (
+	blameWorkersMultiplier         = 2 // Multiplier of NumCPU for blame workers per repo
+	repoWorkersDivisor             = 2 // Divisor of NumCPU for concurrent repo processing
+	maxRepoWorkers                 = 4 // Cap on repo workers to prevent goroutine explosion
+	scanConcurrencyMultiplier      = 4 // Multiplier of NumCPU for filesystem scanning
+	preflightConcurrencyMultiplier = 2 // Multiplier of NumCPU for file counting
+)
+
+// Channel Buffers: CSP Communication
+const (
+	fileTaskBuffer         = 500  // Buffer size for file blame tasks within a repo
+	contributionBuffer     = 1000 // Buffer size for file author stats aggregation
+	repoTaskBuffer         = 50   // Buffer size for repository tasks
+	commitStatsBuffer      = 100  // Buffer size for commit statistics batches
+	repoScanBuffer         = 100  // Buffer size for discovered repos during scanning
+	progressChanDefault    = 1000 // Default progress channel buffer size
+	progressChanThreshold  = 100  // Repo count threshold for smaller progress buffer
+	progressChanMultiplier = 10   // Multiplier for progress channel when repo count < threshold
+)
+
+// Capacity Hints: Pre-allocation for Memory Efficiency
+const (
+	repoInternCapacity   = 2000 // Expected number of repositories for string interning
+	authorCountsCapacity = 32   // Expected authors per file
+	commitStatsCapacity  = 256  // Expected unique authors in commit history
+	fileListCapacity     = 1024 // Initial capacity for file lists
+	fileListQueueBuffer  = 1000 // Channel buffer for file walker
+)
+
+// Timeouts and Intervals
+const (
+	gitBlameTimeout        = 10 * time.Second       // Timeout for individual git blame operations
+	batchFlushInterval     = 500 * time.Millisecond // Database batch flush interval
+	progressReportInterval = 200 * time.Millisecond // Repo progress update interval
+	uiTickerInterval       = 100 * time.Millisecond // UI refresh rate
+)
+
+// Database: Batch Sizes
+const (
+	batchSizeThreshold = 10000 // File stats batch size before flush (increased for write performance)
 	dbFile             = "git-who.db"
-	batchFlushInterval = 500 * time.Millisecond
-	batchSizeThreshold = 2000 // Reduced from 5000 to save memory
-	fileTaskBuffer     = 500  // Reduced from 1000
-	contributionBuffer = 1000 // Reduced from 5000 (280KB → 56KB)
-	repoTaskBuffer     = 50   // Reduced from 100
-	gitBlameTimeout    = 10 * time.Second // Timeout for individual git blame operations
+)
+
+// SQLite: Performance Tuning
+const (
+	sqlitePageSize          = 32768       // Page size (32KB for write-heavy workload)
+	sqliteCacheSize         = -256000     // Page cache size (negative = KB, 256MB)
+	sqliteMmapSize          = 30000000000 // Memory-mapped I/O size (30GB)
+	sqliteJournalSizeLimit  = 67108864    // WAL journal size limit (64MB)
+	sqliteBusyTimeout       = 5000        // Busy timeout in milliseconds
+	sqliteWalAutocheckpoint = 1000        // WAL autocheckpoint interval (pages)
+)
+
+// Scanner: Buffer Sizes for Streaming I/O
+const (
+	scannerBufferSize = 64 * 1024   // Initial scanner buffer (64KB)
+	scannerMaxLine    = 1024 * 1024 // Maximum line size (1MB)
+)
+
+// Time Calculations: Commit Bucketing
+const (
+	hoursPerDay    = 24 // Hours in a day
+	daysPerMonth   = 30 // Approximate days per month
+	commitBucket3M = 3  // Months threshold for 3-month bucket
+	commitBucket6M = 6  // Months threshold for 6-month bucket
+)
+
+// UI: Display Configuration
+const (
+	maxVisibleRepos      = 15 // Maximum repos to show in UI at once
+	maxCompletedTracking = 50 // Ring buffer size for completed repo tracking
+	maxRepoNameLength    = 35 // Maximum characters for repo name display
+	progressBarWidth     = 20 // Character width of progress bar
 )
 
 // UI status indicators (ASCII only)
@@ -40,11 +115,6 @@ const (
 	statusIconCommits     = "[=]"
 	statusIconDone        = "[✓]"
 	statusIconError       = "[X]"
-)
-
-// UI display limits
-const (
-	maxVisibleRepos = 15 // Maximum repos to show at once
 )
 
 // FileTask represents work to blame a specific file
@@ -121,8 +191,8 @@ type RepoIntern struct {
 
 func newRepoIntern() *RepoIntern {
 	return &RepoIntern{
-		pathToID: make(map[string]uint16, 2000), // Pre-allocate for expected repos
-		idToPath: make([]string, 0, 2000),
+		pathToID: make(map[string]uint16, repoInternCapacity),
+		idToPath: make([]string, 0, repoInternCapacity),
 	}
 }
 
@@ -249,10 +319,10 @@ func findGitRepos(path string) ([]RepoInfo, error) {
 	startTime := time.Now()
 
 	// Channel for found repositories
-	results := make(chan RepoInfo, 100)
+	results := make(chan RepoInfo, repoScanBuffer)
 
 	// Semaphore to limit concurrent filesystem operations
-	maxConcurrent := runtime.NumCPU() * 4
+	maxConcurrent := runtime.NumCPU() * scanConcurrencyMultiplier
 	sem := make(chan struct{}, maxConcurrent)
 
 	// WaitGroup to track all scanning goroutines
@@ -312,11 +382,10 @@ func main() {
 	}
 
 	// Tune GC for lower memory usage
-	// GCPercent=50 triggers GC more frequently, reducing peak memory at cost of ~5% CPU
-	debug.SetGCPercent(50)
+	debug.SetGCPercent(gcPercent)
 
-	// Set soft memory limit to 4GB to prevent runaway memory growth
-	debug.SetMemoryLimit(4 * 1024 * 1024 * 1024)
+	// Set soft memory limit to prevent runaway memory growth
+	debug.SetMemoryLimit(memoryLimit)
 
 	if verbose {
 		fmt.Println("Memory optimizations: GC=50%, Limit=4GB, Streaming I/O, Interned paths")
@@ -359,16 +428,15 @@ func main() {
 	defer db.Close()
 
 	// Determine optimal worker counts
-	// Reduced from 4× to 2× to save memory (streaming I/O reduces need for high concurrency)
 	numCPU := runtime.NumCPU()
-	blameWorkers := numCPU * 2 // Reduced from 4 (with streaming we need less concurrency)
-	repoWorkers := numCPU / 2
+	blameWorkers := numCPU * blameWorkersMultiplier
+	repoWorkers := numCPU / repoWorkersDivisor
 	if repoWorkers < 1 {
 		repoWorkers = 1
 	}
-	// Cap repoWorkers at 4 to prevent excessive goroutine proliferation
-	if repoWorkers > 4 {
-		repoWorkers = 4
+	// Cap repoWorkers to prevent excessive goroutine proliferation
+	if repoWorkers > maxRepoWorkers {
+		repoWorkers = maxRepoWorkers
 	}
 	if verbose {
 		fmt.Printf("Using %d CPU cores with %d repo workers and %d blame workers per repo\n",
@@ -379,16 +447,16 @@ func main() {
 	// Create CSP channels
 	repoTasks := make(chan RepoInfo, repoTaskBuffer)
 	repoResults := make(chan RepoResult, len(repos))
-	// Reduced progressChan buffer from len(repos)*10 to 1000 to save memory
-	progressChanSize := 1000
-	if len(repos) < 100 {
-		progressChanSize = len(repos) * 10
+	// Scale progress channel based on repo count
+	progressChanSize := progressChanDefault
+	if len(repos) < progressChanThreshold {
+		progressChanSize = len(repos) * progressChanMultiplier
 	}
 	progressChan := make(chan RepoProgress, progressChanSize)
 
 	// Centralized database write channels (shared across all repos)
 	fileStatsChan := make(chan FileAuthorStats, contributionBuffer)
-	commitStatsChan := make(chan CommitStatsBatch, 100)
+	commitStatsChan := make(chan CommitStatsBatch, commitStatsBuffer)
 
 	// Start progress UI goroutine FIRST (consumer must exist before producer sends)
 	uiDone := make(chan struct{})
@@ -584,7 +652,7 @@ func processRepository(repo RepoInfo, blameWorkers int, progressChan chan<- Repo
 	progressDone := make(chan struct{})
 	go func() {
 		defer close(progressDone)
-		ticker := time.NewTicker(200 * time.Millisecond)
+		ticker := time.NewTicker(progressReportInterval)
 		defer ticker.Stop()
 
 		for {
@@ -672,18 +740,39 @@ func createDatabase() (*sql.DB, error) {
 		return nil, err
 	}
 
-	// Enable performance optimizations
+	// Enable performance optimizations for write-heavy workload
+	// CRITICAL: page_size MUST be set BEFORE creating tables
 	pragmas := []string{
+		// Page size must be first (before any tables exist)
+		fmt.Sprintf("PRAGMA page_size=%d", sqlitePageSize),
+		// WAL mode for concurrent reads during writes
 		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA cache_size=-64000", // 64MB cache
+		// synchronous=OFF for maximum write speed (accepts system crash risk)
+		"PRAGMA synchronous=OFF",
+		// Large page cache for bulk writes
+		fmt.Sprintf("PRAGMA cache_size=%d", sqliteCacheSize),
+		// Memory-mapped I/O for reduced syscall overhead
+		fmt.Sprintf("PRAGMA mmap_size=%d", sqliteMmapSize),
+		// Temp tables in memory
 		"PRAGMA temp_store=MEMORY",
-		"PRAGMA mmap_size=268435456", // 256MB mmap
+		// Prevent WAL from growing unbounded
+		fmt.Sprintf("PRAGMA journal_size_limit=%d", sqliteJournalSizeLimit),
+		// Busy timeout for lock contention
+		fmt.Sprintf("PRAGMA busy_timeout=%d", sqliteBusyTimeout),
+		// Exclusive locking mode (safe for single-writer, eliminates lock overhead)
+		"PRAGMA locking_mode=EXCLUSIVE",
+		// WAL autocheckpoint interval
+		fmt.Sprintf("PRAGMA wal_autocheckpoint=%d", sqliteWalAutocheckpoint),
+		// Disable auto-vacuum for write performance
+		"PRAGMA auto_vacuum=NONE",
 	}
 
 	for _, pragma := range pragmas {
 		if _, err := db.Exec(pragma); err != nil {
-			return nil, fmt.Errorf("pragma failed: %w", err)
+			return nil, fmt.Errorf("pragma failed (%s): %w", pragma, err)
+		}
+		if verbose {
+			fmt.Printf("  Applied: %s\n", pragma)
 		}
 	}
 
@@ -719,7 +808,7 @@ CREATE INDEX idx_lines ON file_author(lines DESC);
 // getFilesAtHEAD fetches all code files for a repository using gocodewalker
 // This respects .gitignore and only processes files with known code extensions
 func getFilesAtHEAD(repoPath string) ([]string, error) {
-	fileListQueue := make(chan *gocodewalker.File, 1000)
+	fileListQueue := make(chan *gocodewalker.File, fileListQueueBuffer)
 	fileWalker := gocodewalker.NewFileWalker(repoPath, fileListQueue)
 
 	// Only process known code file extensions
@@ -740,7 +829,7 @@ func getFilesAtHEAD(repoPath string) ([]string, error) {
 	go fileWalker.Start()
 
 	// Collect files
-	files := make([]string, 0, 1024)
+	files := make([]string, 0, fileListCapacity)
 	for f := range fileListQueue {
 		files = append(files, f.Location)
 	}
@@ -750,7 +839,7 @@ func getFilesAtHEAD(repoPath string) ([]string, error) {
 
 // countFilesInRepo performs pre-flight file counting for a single repository
 func countFilesInRepo(repo RepoInfo) (RepoInfo, error) {
-	fileListQueue := make(chan *gocodewalker.File, 1000)
+	fileListQueue := make(chan *gocodewalker.File, fileListQueueBuffer)
 	fileWalker := gocodewalker.NewFileWalker(repo.Path, fileListQueue)
 
 	fileWalker.AllowListExtensions = getCodeExtensions()
@@ -789,7 +878,7 @@ func preflightCountFiles(repos []RepoInfo) []RepoInfo {
 	var wg sync.WaitGroup
 
 	// Process repos in parallel with concurrency limit
-	maxConcurrent := runtime.NumCPU() * 2
+	maxConcurrent := runtime.NumCPU() * preflightConcurrencyMultiplier
 	sem := make(chan struct{}, maxConcurrent)
 
 	for _, repo := range repos {
@@ -840,7 +929,7 @@ func preflightCountFiles(repos []RepoInfo) []RepoInfo {
 // parseGitBlamePorcelain parses git blame --line-porcelain output and aggregates by author
 // Uses a scanner for streaming to avoid loading entire output into memory
 func parseGitBlamePorcelain(scanner *bufio.Scanner) map[string]int {
-	authorCounts := make(map[string]int, 32) // Pre-allocate for typical file
+	authorCounts := make(map[string]int, authorCountsCapacity)
 
 	var currentAuthor string
 
@@ -906,7 +995,7 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 
 		// Parse streaming output - no buffering of entire file
 		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 64KB buffer, 1MB max line
+		scanner.Buffer(make([]byte, scannerBufferSize), scannerMaxLine)
 		authorCounts := parseGitBlamePorcelain(scanner)
 
 		if err := cmd.Wait(); err != nil {
@@ -979,10 +1068,10 @@ func processCommitStats(repoPath string, repoID uint16, commitStatsChan chan<- C
 	}
 
 	// Aggregate commits by author and time bucket in memory
-	commitStats := make(map[string]*CommitStats, 256) // Pre-allocate
+	commitStats := make(map[string]*CommitStats, commitStatsCapacity)
 
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 64KB buffer, 1MB max line
+	scanner.Buffer(make([]byte, scannerBufferSize), scannerMaxLine)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1007,11 +1096,11 @@ func processCommitStats(repoPath string, repoID uint16, commitStatsChan chan<- C
 		}
 
 		// Determine time bucket
-		monthsAgo := int(now.Sub(commitDate).Hours() / 24 / 30)
+		monthsAgo := int(now.Sub(commitDate).Hours() / hoursPerDay / daysPerMonth)
 		switch {
-		case monthsAgo < 3:
+		case monthsAgo < commitBucket3M:
 			stats.Commits3M++
-		case monthsAgo < 6:
+		case monthsAgo < commitBucket6M:
 			stats.Commits6M++
 		default:
 			stats.Commits12M++
@@ -1040,7 +1129,7 @@ func processCommitStats(repoPath string, repoID uint16, commitStatsChan chan<- C
 	return nil
 }
 
-// writeCommitStatsBatch writes commit statistics in a single transaction
+// writeCommitStatsBatch writes commit statistics using optimized multi-row INSERT
 func writeCommitStatsBatch(db *sql.DB, repoPath string, stats map[string]*CommitStats) error {
 	if len(stats) == 0 {
 		return nil
@@ -1052,23 +1141,32 @@ func writeCommitStatsBatch(db *sql.DB, repoPath string, stats map[string]*Commit
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare("INSERT INTO author_commit_stats VALUES (?, ?, ?, ?, ?, ?)")
+	// Build multi-row INSERT statement
+	// INSERT INTO author_commit_stats VALUES (?,?,?,?,?,?),(?,?,?,?,?,?)...
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO author_commit_stats VALUES ")
+
+	args := make([]interface{}, 0, len(stats)*6)
+	first := true
+	for _, stat := range stats {
+		if !first {
+			sb.WriteString(",")
+		}
+		first = false
+		sb.WriteString("(?,?,?,?,?,?)")
+		args = append(args, repoPath, stat.Author, stat.Commits3M, stat.Commits6M, stat.Commits12M, stat.Merges)
+	}
+
+	_, err = tx.Exec(sb.String(), args...)
 	if err != nil {
 		return err
-	}
-	defer stmt.Close()
-
-	for _, stat := range stats {
-		_, err := stmt.Exec(repoPath, stat.Author, stat.Commits3M, stat.Commits6M, stat.Commits12M, stat.Merges)
-		if err != nil {
-			return err
-		}
 	}
 
 	return tx.Commit()
 }
 
-// writeBatch writes a batch of file author stats using prepared statement
+// writeBatch writes a batch of file author stats using optimized multi-row INSERT
+// This is significantly faster than prepared statement loops for bulk inserts
 func writeBatch(db *sql.DB, batch []FileAuthorStats) error {
 	if len(batch) == 0 {
 		return nil
@@ -1080,19 +1178,26 @@ func writeBatch(db *sql.DB, batch []FileAuthorStats) error {
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.Prepare("INSERT INTO file_author VALUES (?, ?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
+	// Build multi-row INSERT statement
+	// INSERT INTO file_author VALUES (?,?,?,?),(?,?,?,?),(?,?,?,?)...
+	var sb strings.Builder
+	sb.WriteString("INSERT INTO file_author VALUES ")
 
+	args := make([]interface{}, 0, len(batch)*4)
 	for i := range batch {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString("(?,?,?,?)")
+
 		// Convert RepoID back to path for database
 		repoPath := repoIntern.Lookup(batch[i].RepoID)
-		_, err := stmt.Exec(repoPath, batch[i].FilePath, batch[i].Author, batch[i].Lines)
-		if err != nil {
-			return err
-		}
+		args = append(args, repoPath, batch[i].FilePath, batch[i].Author, batch[i].Lines)
+	}
+
+	_, err = tx.Exec(sb.String(), args...)
+	if err != nil {
+		return err
 	}
 
 	return tx.Commit()
@@ -1107,14 +1212,13 @@ func progressUI(progressChan <-chan RepoProgress, done chan<- struct{}) {
 	repoOrder := make([]string, 0) // Maintain insertion order
 
 	// Track completed repos separately with limited ring buffer
-	const maxCompletedTracking = 50
 	completedCount := 0
 	erroredCount := 0
 
 	// Start runtime timer
 	startTime := time.Now()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(uiTickerInterval)
 	defer ticker.Stop()
 
 	// Clear screen and hide cursor
@@ -1297,15 +1401,13 @@ func countVisibleQueued(repoStates map[string]*RepoProgress, visible []string) i
 
 // renderRepoLine renders a single repository's progress line
 func renderRepoLine(p *RepoProgress) int {
-	const maxNameLen = 35
-
 	// Clear entire line first to prevent overlap
 	fmt.Print("\033[K")
 
 	// Truncate name if too long
 	displayName := p.Name
-	if len(displayName) > maxNameLen {
-		displayName = displayName[:maxNameLen-3] + "..."
+	if len(displayName) > maxRepoNameLength {
+		displayName = displayName[:maxRepoNameLength-3] + "..."
 	}
 
 	// Status indicator and color
@@ -1352,13 +1454,12 @@ func renderRepoLine(p *RepoProgress) int {
 	// Progress bar for blaming phase
 	progressBar := ""
 	if p.Status == "blaming" && p.FilesTotal > 0 {
-		barWidth := 20
-		filled := int(float64(p.FilesBlamed) / float64(p.FilesTotal) * float64(barWidth))
-		if filled > barWidth {
-			filled = barWidth
+		filled := int(float64(p.FilesBlamed) / float64(p.FilesTotal) * float64(progressBarWidth))
+		if filled > progressBarWidth {
+			filled = progressBarWidth
 		}
 		progressBar = " ["
-		for i := 0; i < barWidth; i++ {
+		for i := 0; i < progressBarWidth; i++ {
 			if i < filled {
 				progressBar += "="
 			} else {
@@ -1370,7 +1471,7 @@ func renderRepoLine(p *RepoProgress) int {
 	}
 
 	fmt.Printf("%s%-4s %-*s %s%s\033[0m\n",
-		color, statusIcon, maxNameLen, displayName, statusText, progressBar)
+		color, statusIcon, maxRepoNameLength, displayName, statusText, progressBar)
 
 	return 1
 }
