@@ -94,8 +94,25 @@ const (
 
 // Scanner: Buffer Sizes for Streaming I/O
 const (
-	scannerBufferSize = 64 * 1024   // Initial scanner buffer (64KB)
+	scannerBufferSize = 128 * 1024  // Initial scanner buffer (128KB, increased to prevent reallocation)
 	scannerMaxLine    = 1024 * 1024 // Maximum line size (1MB)
+)
+
+// Worker Buffer Reuse: Per-worker buffer sizes to eliminate allocation churn
+// Each worker goroutine maintains its own buffers to avoid contention
+//
+// Tuning guide:
+// - workerScannerBufferSize: Set to max expected blame output size per file
+//   Too small = reallocations, too large = wasted memory
+// - workerAuthorMapCapacity: Set to max expected unique authors per file
+//   Too small = map growth, too large = wasted memory
+//
+// Memory cost per worker = workerScannerBufferSize + (workerAuthorMapCapacity * ~24 bytes)
+// Total memory cost = blameWorkers * (workerScannerBufferSize + workerAuthorMapCapacity * 24)
+// Example: 16 workers * (256KB + 128*24) = ~4.1MB persistent
+const (
+	workerScannerBufferSize  = 256 * 1024 // Scanner buffer per worker (256KB, tune for large files)
+	workerAuthorMapCapacity  = 128        // Initial author map capacity per worker (tune for files with many authors)
 )
 
 // Time Calculations: Commit Bucketing
@@ -1174,8 +1191,8 @@ func preflightCountFiles(repos []RepoInfo, fileLister FileLister) []RepoInfo {
 // parseGitBlamePorcelain parses git blame --line-porcelain output and aggregates by author
 // Uses a scanner for streaming to avoid loading entire output into memory
 // Returns map keyed by interned AuthorID instead of email string
-func parseGitBlamePorcelain(scanner *bufio.Scanner) map[uint32]int {
-	authorCounts := make(map[uint32]int, authorCountsCapacity)
+// Accepts a reusable authorCounts map to eliminate per-file allocations
+func parseGitBlamePorcelain(scanner *bufio.Scanner, authorCounts map[uint32]int) map[uint32]int {
 
 	var currentAuthorID uint32
 
@@ -1202,6 +1219,28 @@ func parseGitBlamePorcelain(scanner *bufio.Scanner) map[uint32]int {
 	return authorCounts
 }
 
+// blameWorkerState holds reusable buffers for a blame worker
+// Reusing buffers eliminates per-file allocation churn (640MB for 10K files)
+// Each worker maintains its own buffers to avoid contention in highly parallel workloads
+type blameWorkerState struct {
+	scannerBuf   []byte
+	authorCounts map[uint32]int
+}
+
+func newBlameWorkerState() *blameWorkerState {
+	return &blameWorkerState{
+		scannerBuf:   make([]byte, workerScannerBufferSize),
+		authorCounts: make(map[uint32]int, workerAuthorMapCapacity),
+	}
+}
+
+func (s *blameWorkerState) reset() {
+	// Clear map for reuse - faster than reallocating
+	for k := range s.authorCounts {
+		delete(s.authorCounts, k)
+	}
+}
+
 // blameWorker processes file tasks and emits aggregated author stats
 // Uses streaming to avoid buffering entire git blame output in memory
 func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks <-chan FileTask,
@@ -1209,7 +1248,12 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 	filesSkipped *atomic.Int64, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	// Create worker-local state with reusable buffers
+	state := newBlameWorkerState()
+
 	for task := range fileTasks {
+		// Reset state for next file
+		state.reset()
 		select {
 		case <-ctx.Done():
 			return
@@ -1242,8 +1286,8 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 
 		// Parse streaming output - no buffering of entire file
 		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, scannerBufferSize), scannerMaxLine)
-		authorCounts := parseGitBlamePorcelain(scanner)
+		scanner.Buffer(state.scannerBuf, scannerMaxLine)
+		authorCounts := parseGitBlamePorcelain(scanner, state.authorCounts)
 
 		if err := cmd.Wait(); err != nil {
 			// Check if the error is due to timeout
