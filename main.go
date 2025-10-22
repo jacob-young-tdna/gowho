@@ -81,7 +81,7 @@ const (
 
 // Database: Batch Sizes
 const (
-	batchSizeThreshold = 2500 // File stats batch size before flush (increased for write performance)
+	batchSizeThreshold = 5000 // File stats batch size before flush (increased for write performance)
 	dbFile             = "git-who.db"
 )
 
@@ -105,17 +105,17 @@ const (
 // Each worker goroutine maintains its own buffers to avoid contention
 //
 // Tuning guide:
-// - workerScannerBufferSize: Set to max expected blame output size per file
-//   Too small = reallocations, too large = wasted memory
-// - workerAuthorMapCapacity: Set to max expected unique authors per file
-//   Too small = map growth, too large = wasted memory
+//   - workerScannerBufferSize: Set to max expected blame output size per file
+//     Too small = reallocations, too large = wasted memory
+//   - workerAuthorMapCapacity: Set to max expected unique authors per file
+//     Too small = map growth, too large = wasted memory
 //
 // Memory cost per worker = workerScannerBufferSize + (workerAuthorMapCapacity * ~24 bytes)
 // Total memory cost = blameWorkers * (workerScannerBufferSize + workerAuthorMapCapacity * 24)
 // Example: 16 workers * (256KB + 128*24) = ~4.1MB persistent
 const (
-	workerScannerBufferSize  = 256 * 1024 // Scanner buffer per worker (256KB, tune for large files)
-	workerAuthorMapCapacity  = 128        // Initial author map capacity per worker (tune for files with many authors)
+	workerScannerBufferSize = 256 * 1024 // Scanner buffer per worker (256KB, tune for large files)
+	workerAuthorMapCapacity = 128        // Initial author map capacity per worker (tune for files with many authors)
 )
 
 // Time Calculations: Commit Bucketing
