@@ -2,6 +2,8 @@ gowho
 gowho-*
 git-who.*
 
+repos/*
+
 
 # Binaries for programs and plugins
 *.exe
