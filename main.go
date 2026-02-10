@@ -164,8 +164,8 @@ type OptimizationMode int
 
 const (
 	OptimizeNone  OptimizationMode = iota // Skip optimization
-	OptimizeQuick                          // Commit-graph + config only (1-5 min)
-	OptimizeFull                           // Commit-graph + config + repack (5-30 min)
+	OptimizeQuick                         // Commit-graph + config only (1-5 min)
+	OptimizeFull                          // Commit-graph + config + repack (5-30 min)
 )
 
 // String returns the string representation for display
@@ -645,13 +645,13 @@ func fullOptimizeRepo(repoPath string, repoName string) error {
 	// Repack with speed-optimized settings (depth=5 for fast decompression)
 	// This trades ~25% more disk space for 3-5x faster object access
 	cmd := exec.Command("git", "-C", repoPath, "repack",
-		"-f",            // Force repack even if recent pack exists
-		"-a",            // Pack all objects into single packfile
-		"-d",            // Delete redundant old packfiles
-		"-b",            // Create bitmap index
-		"--depth=5",     // Shallow delta chains for fast decompression
-		"--window=15",   // Small window for faster repacking
-		"--threads=0")   // Auto-detect CPU count
+		"-f",          // Force repack even if recent pack exists
+		"-a",          // Pack all objects into single packfile
+		"-d",          // Delete redundant old packfiles
+		"-b",          // Create bitmap index
+		"--depth=5",   // Shallow delta chains for fast decompression
+		"--window=15", // Small window for faster repacking
+		"--threads=0") // Auto-detect CPU count
 
 	// Set timeout for repack (can take 5-30 minutes on large repos)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -858,62 +858,354 @@ func findGitRepos(path string) ([]RepoInfo, error) {
 	return repos, nil
 }
 
+// runOptimizeCommand runs the optimize command (separate from analyze)
+// Optimizes repos in REVERSE order (largest first) using all CPU cores
+func runOptimizeCommand(targetPath string, optimizationMode OptimizationMode, forceOptimize bool, jobs int) {
+	if verbose {
+		fmt.Println("=== Git Who - Repository Optimizer ===")
+		fmt.Println()
+		modeStr := "quick"
+		if optimizationMode == OptimizeFull {
+			modeStr = "full"
+		}
+		fmt.Printf("Optimization mode: %s%s\n", modeStr, map[bool]string{true: " (forced)", false: ""}[forceOptimize])
+		fmt.Printf("Parallel workers: %d\n", jobs)
+		fmt.Println()
+	}
+
+	// Find git repositories
+	repos, err := findGitRepos(targetPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if verbose {
+		fmt.Printf("Found %d git repository(ies) to optimize\n\n", len(repos))
+	}
+
+	// Count files to determine repo sizes
+	fileLister := GitLsTreeLister{}
+	repos = preflightCountFiles(repos, fileLister)
+
+	// Sort by file count in REVERSE order (largest first)
+	sort.Slice(repos, func(i, j int) bool {
+		return repos[i].FileCount > repos[j].FileCount
+	})
+
+	if verbose {
+		fmt.Println("Optimization order (largest to smallest):")
+		for i, repo := range repos {
+			fmt.Printf("  %2d. %-30s (%d files)\n", i+1, repo.Name, repo.FileCount)
+		}
+		fmt.Println()
+	}
+
+	// Create progress channel
+	progressChanSize := progressChanDefault
+	if len(repos) < progressChanThreshold {
+		progressChanSize = len(repos) * progressChanMultiplier
+	}
+	progressChan := make(chan RepoProgress, progressChanSize)
+
+	// Start progress UI goroutine
+	uiDone := make(chan struct{})
+	go progressUI(progressChan, uiDone)
+
+	// Initialize all repos as queued
+	for _, repo := range repos {
+		progressChan <- RepoProgress{
+			Name:   repo.Name,
+			Status: StatusQueued,
+		}
+	}
+
+	// Progress tracking
+	type OptimizeResult struct {
+		RepoName string
+		Success  bool
+		Error    error
+		Skipped  bool
+	}
+
+	results := make(chan OptimizeResult, len(repos))
+	repoTasks := make(chan RepoInfo, len(repos))
+
+	// Start optimization workers (use all cores)
+	var wg sync.WaitGroup
+	for i := 0; i < jobs; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for repo := range repoTasks {
+				// Update status: optimizing
+				progressChan <- RepoProgress{
+					Name:   repo.Name,
+					Status: StatusOptimizing,
+				}
+
+				// Check if should skip optimization
+				if !forceOptimize && shouldSkipOptimization(repo.Path, optimizationMode) {
+					if verbose {
+						fmt.Fprintf(os.Stderr, "[Worker %d] Skipping %s (already optimized)\n", workerID, repo.Name)
+					}
+					progressChan <- RepoProgress{
+						Name:   repo.Name,
+						Status: StatusDone,
+					}
+					results <- OptimizeResult{RepoName: repo.Name, Success: true, Skipped: true}
+					continue
+				}
+
+				// Check if needs optimization
+				if !shouldOptimizeRepo(repo.Path) && !forceOptimize {
+					if verbose {
+						fmt.Fprintf(os.Stderr, "[Worker %d] Skipping %s (already optimal)\n", workerID, repo.Name)
+					}
+					progressChan <- RepoProgress{
+						Name:   repo.Name,
+						Status: StatusDone,
+					}
+					results <- OptimizeResult{RepoName: repo.Name, Success: true, Skipped: true}
+					continue
+				}
+
+				// Optimize repo
+				var err error
+				switch optimizationMode {
+				case OptimizeQuick:
+					err = quickOptimizeRepo(repo.Path, repo.Name)
+				case OptimizeFull:
+					err = fullOptimizeRepo(repo.Path, repo.Name)
+				}
+
+				if err != nil {
+					if verbose {
+						fmt.Fprintf(os.Stderr, "[Worker %d] ERROR optimizing %s: %v\n", workerID, repo.Name, err)
+					}
+					progressChan <- RepoProgress{
+						Name:         repo.Name,
+						Status:       StatusError,
+						ErrorMessage: err.Error(),
+					}
+					results <- OptimizeResult{RepoName: repo.Name, Success: false, Error: err}
+				} else {
+					// Save marker
+					if err := saveOptimizationMarker(repo.Path, optimizationMode); err != nil {
+						if verbose {
+							fmt.Fprintf(os.Stderr, "[Worker %d] Warning: failed to save marker for %s: %v\n", workerID, repo.Name, err)
+						}
+					}
+					if verbose {
+						fmt.Fprintf(os.Stderr, "[Worker %d] ✓ Completed %s\n", workerID, repo.Name)
+					}
+					progressChan <- RepoProgress{
+						Name:   repo.Name,
+						Status: StatusDone,
+					}
+					results <- OptimizeResult{RepoName: repo.Name, Success: true}
+				}
+			}
+		}(i)
+	}
+
+	// Feed repos to workers (largest first)
+	go func() {
+		for _, repo := range repos {
+			repoTasks <- repo
+		}
+		close(repoTasks)
+	}()
+
+	// Wait for workers in background
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results
+	successCount := 0
+	skippedCount := 0
+	errorCount := 0
+	for result := range results {
+		if result.Skipped {
+			skippedCount++
+		} else if result.Success {
+			successCount++
+		} else {
+			errorCount++
+		}
+	}
+
+	// Close progress UI and wait for it to finish
+	close(progressChan)
+	<-uiDone
+
+	// Summary
+	fmt.Println()
+	fmt.Println("=== Optimization Complete ===")
+	fmt.Printf("Successfully optimized: %d/%d repositories\n", successCount, len(repos))
+	if skippedCount > 0 {
+		fmt.Printf("Skipped (already optimized): %d\n", skippedCount)
+	}
+	if errorCount > 0 {
+		fmt.Printf("Errors: %d\n", errorCount)
+	}
+	fmt.Println()
+	fmt.Println("You can now run 'gowho analyze' to benefit from 3-7x faster git blame operations.")
+	fmt.Println()
+}
+
 func printHelp() {
 	fmt.Println("gowho - Git repository contribution analyzer")
 	fmt.Println()
 	fmt.Println("USAGE:")
-	fmt.Println("  gowho [OPTIONS] [PATH]")
+	fmt.Println("  gowho [COMMAND] [OPTIONS] [PATH]")
 	fmt.Println()
-	fmt.Println("DESCRIPTION:")
-	fmt.Println("  Analyzes git repositories to determine code ownership by running")
-	fmt.Println("  git-blame on all tracked files and analyzing commit history.")
-	fmt.Println("  Results are stored in a SQLite database (git-who.db).")
+	fmt.Println("COMMANDS:")
+	fmt.Println("  analyze       Analyze repositories (default command)")
+	fmt.Println("  optimize      Optimize repositories for faster analysis")
 	fmt.Println()
-	fmt.Println("OPTIONS:")
+	fmt.Println("ANALYZE OPTIONS:")
 	fmt.Println("  -h, --help                    Show this help message")
 	fmt.Println("  -v, --verbose                 Enable verbose output")
 	fmt.Println("  -L, --file-list=MODE          File listing mode: git or fs (default: git)")
 	fmt.Println("                                  git: Use git ls-tree (tracked files only)")
 	fmt.Println("                                  fs:  Use filesystem walker (respects .gitignore)")
-	fmt.Println("  -O, --optimize-repos=MODE     Git repository optimization mode (default: none)")
-	fmt.Println("                                  none:  Skip optimization")
+	fmt.Println()
+	fmt.Println("OPTIMIZE OPTIONS:")
+	fmt.Println("  -h, --help                    Show this help message")
+	fmt.Println("  -v, --verbose                 Enable verbose output")
+	fmt.Println("  -m, --mode=MODE               Optimization mode (default: quick)")
 	fmt.Println("                                  quick: Commit-graph + config (1-5 min, 3-3.5x faster)")
 	fmt.Println("                                  full:  Commit-graph + config + repack (5-30 min, 5-7x faster)")
-	fmt.Println("      --force-optimize          Force re-optimization even if already optimized")
+	fmt.Println("  -j, --jobs=N                  Number of parallel optimization workers (default: all CPUs)")
+	fmt.Println("      --force                   Force re-optimization even if already optimized")
 	fmt.Println()
 	fmt.Println("ARGUMENTS:")
 	fmt.Println("  PATH                          Directory to scan for git repositories (default: .)")
 	fmt.Println()
 	fmt.Println("EXAMPLES:")
+	fmt.Println("  # Standard workflow (optimize first, then analyze)")
+	fmt.Println("  gowho optimize ~/projects     Optimize all repos (largest first)")
+	fmt.Println("  gowho analyze ~/projects      Then analyze all repos")
+	fmt.Println()
+	fmt.Println("  # Quick analysis without optimization")
 	fmt.Println("  gowho                         Analyze current directory")
 	fmt.Println("  gowho ~/projects              Analyze all repos in ~/projects")
-	fmt.Println("  gowho -v .                    Verbose output for current directory")
-	fmt.Println("  gowho --file-list=fs .        Use filesystem walker instead of git ls-tree")
-	fmt.Println("  gowho --optimize-repos=quick  Optimize repos before analyzing (recommended)")
-	fmt.Println("  gowho --optimize-repos=full   Deep optimization with repack (for large repos)")
+	fmt.Println()
+	fmt.Println("  # Full optimization for large codebases")
+	fmt.Println("  gowho optimize --mode=full --jobs=16 ~/projects")
+	fmt.Println()
+	fmt.Println("  # Verbose mode")
+	fmt.Println("  gowho optimize -v .           Show detailed optimization progress")
+	fmt.Println("  gowho analyze -v .            Show detailed analysis progress")
 	fmt.Println()
 	fmt.Println("OUTPUT:")
-	fmt.Println("  Creates git-who.db with two tables:")
+	fmt.Println("  analyze: Creates git-who.db with two tables:")
 	fmt.Println("    - file_author: Line counts per author per file")
 	fmt.Println("    - author_commit_stats: Commit activity over 3/6/12 month periods")
 	fmt.Println()
-	fmt.Println("OPTIMIZATION:")
-	fmt.Println("  Git repository optimization significantly speeds up git blame operations:")
-	fmt.Println("    - Quick mode: Generates commit-graph with Bloom filters (3-3.5x faster)")
-	fmt.Println("    - Full mode: Also repacks with shallow delta chains (5-7x faster)")
-	fmt.Println("  Optimization is cached per-repo and skipped if already applied (within 30 days).")
-	fmt.Println("  Use --force-optimize to re-optimize regardless of cache.")
+	fmt.Println("  optimize: Creates .gowho-optimized markers in each repo's .git directory")
+	fmt.Println()
+	fmt.Println("OPTIMIZATION STRATEGY:")
+	fmt.Println("  The optimize command processes repos in REVERSE order (largest first):")
+	fmt.Println("    - Large repos (30+ year codebases) optimize first using all CPU cores")
+	fmt.Println("    - Small repos optimize quickly after")
+	fmt.Println("    - When you run analyze, large repos are already optimized (5-7x faster)")
+	fmt.Println()
+	fmt.Println("  Recommended for large repository sets (1000+ repos):")
+	fmt.Println("    1. Run 'gowho optimize' once (may take 30-60 min for huge repos)")
+	fmt.Println("    2. Run 'gowho analyze' repeatedly (benefits from optimization cache)")
 	fmt.Println()
 }
 
 func main() {
-	// Parse command line arguments
+	// Detect command (optimize or analyze)
+	command := "analyze" // default command
+	argOffset := 1
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		if os.Args[1] == "optimize" || os.Args[1] == "analyze" {
+			command = os.Args[1]
+			argOffset = 2
+		}
+	}
+
+	// Parse command-specific arguments
+	if command == "optimize" {
+		// OPTIMIZE COMMAND
+		targetPath := "."
+		optimizationMode := OptimizeQuick // default to quick
+		forceOptimize := false
+		jobs := runtime.NumCPU() // default to all CPUs
+
+		for i := argOffset; i < len(os.Args); i++ {
+			arg := os.Args[i]
+			switch {
+			case arg == "-h" || arg == "--help":
+				printHelp()
+				os.Exit(0)
+			case arg == "-v" || arg == "--verbose":
+				verbose = true
+			case strings.HasPrefix(arg, "--mode="):
+				v := strings.TrimPrefix(arg, "--mode=")
+				switch v {
+				case "quick":
+					optimizationMode = OptimizeQuick
+				case "full":
+					optimizationMode = OptimizeFull
+				default:
+					fmt.Fprintf(os.Stderr, "Unknown --mode=%s (use quick|full)\n", v)
+					os.Exit(2)
+				}
+			case arg == "-m" && i+1 < len(os.Args):
+				i++
+				v := os.Args[i]
+				switch v {
+				case "quick":
+					optimizationMode = OptimizeQuick
+				case "full":
+					optimizationMode = OptimizeFull
+				default:
+					fmt.Fprintf(os.Stderr, "Unknown -m %s (use quick|full)\n", v)
+					os.Exit(2)
+				}
+			case strings.HasPrefix(arg, "--jobs="):
+				v := strings.TrimPrefix(arg, "--jobs=")
+				var err error
+				jobs, err = fmt.Sscanf(v, "%d", &jobs)
+				if err != nil || jobs < 1 {
+					fmt.Fprintf(os.Stderr, "Invalid --jobs=%s (use positive integer)\n", v)
+					os.Exit(2)
+				}
+			case arg == "-j" && i+1 < len(os.Args):
+				i++
+				v := os.Args[i]
+				var err error
+				_, err = fmt.Sscanf(v, "%d", &jobs)
+				if err != nil || jobs < 1 {
+					fmt.Fprintf(os.Stderr, "Invalid -j %s (use positive integer)\n", v)
+					os.Exit(2)
+				}
+			case arg == "--force":
+				forceOptimize = true
+			default:
+				if !strings.HasPrefix(arg, "-") {
+					targetPath = arg
+				}
+			}
+		}
+
+		// Run optimize command
+		runOptimizeCommand(targetPath, optimizationMode, forceOptimize, jobs)
+		return
+	}
+
+	// ANALYZE COMMAND (default)
 	targetPath := "."
 	fileListMode := fileListModeDefault
-	optimizationMode := OptimizeNone
-	forceOptimize := false
 
-	for i := 1; i < len(os.Args); i++ {
+	for i := argOffset; i < len(os.Args); i++ {
 		arg := os.Args[i]
 		switch {
 		case arg == "-h" || arg == "--help":
@@ -936,35 +1228,6 @@ func main() {
 				os.Exit(2)
 			}
 			fileListMode = v
-		case strings.HasPrefix(arg, "--optimize-repos="):
-			v := strings.TrimPrefix(arg, "--optimize-repos=")
-			switch v {
-			case "none":
-				optimizationMode = OptimizeNone
-			case "quick":
-				optimizationMode = OptimizeQuick
-			case "full":
-				optimizationMode = OptimizeFull
-			default:
-				fmt.Fprintf(os.Stderr, "Unknown --optimize-repos=%s (use none|quick|full)\n", v)
-				os.Exit(2)
-			}
-		case arg == "-O" && i+1 < len(os.Args):
-			i++
-			v := os.Args[i]
-			switch v {
-			case "none":
-				optimizationMode = OptimizeNone
-			case "quick":
-				optimizationMode = OptimizeQuick
-			case "full":
-				optimizationMode = OptimizeFull
-			default:
-				fmt.Fprintf(os.Stderr, "Unknown -O %s (use none|quick|full)\n", v)
-				os.Exit(2)
-			}
-		case arg == "--force-optimize":
-			forceOptimize = true
 		default:
 			if !strings.HasPrefix(arg, "-") {
 				targetPath = arg
@@ -984,15 +1247,6 @@ func main() {
 		fmt.Println("=== Git Who - Repository Contribution Analyzer (Optimized Go Edition) ===")
 		fmt.Println()
 		fmt.Printf("File listing mode: %s\n", fileListMode)
-		if optimizationMode != OptimizeNone {
-			modeStr := "quick"
-			if optimizationMode == OptimizeFull {
-				modeStr = "full"
-			}
-			fmt.Printf("Repository optimization: %s%s\n", modeStr, map[bool]string{true: " (forced)", false: ""}[forceOptimize])
-		} else {
-			fmt.Println("Repository optimization: disabled")
-		}
 		fmt.Println()
 	}
 
@@ -1093,7 +1347,7 @@ func main() {
 	var repoWg sync.WaitGroup
 	for i := 0; i < repoWorkers; i++ {
 		repoWg.Add(1)
-		go repoWorker(blameWorkers, optimizationMode, forceOptimize, repoTasks, repoResults, progressChan, fileStatsChan, commitStatsChan, fileLister, &repoWg)
+		go repoWorker(blameWorkers, repoTasks, repoResults, progressChan, fileStatsChan, commitStatsChan, fileLister, &repoWg)
 	}
 
 	// Feed repositories to workers
@@ -1209,50 +1463,12 @@ func centralizedDatabaseWriter(db *sql.DB, fileStats <-chan FileAuthorStats,
 }
 
 // processRepository analyzes a single git repository
-func processRepository(repo RepoInfo, blameWorkers int, optimizationMode OptimizationMode, forceOptimize bool,
+func processRepository(repo RepoInfo, blameWorkers int,
 	progressChan chan<- RepoProgress, fileStatsChan chan<- FileAuthorStats,
 	commitStatsChan chan<- CommitStatsBatch, fileLister FileLister) error {
 
 	// Intern the repository path once at the start
 	repoID := repoIntern.Intern(repo.Path)
-
-	// Optimization phase (if requested)
-	if optimizationMode != OptimizeNone {
-		// Check if we should skip optimization (already optimized and not forced)
-		if !forceOptimize && shouldSkipOptimization(repo.Path, optimizationMode) {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "Skipping optimization for %s (already optimized)\n", repo.Name)
-			}
-		} else if shouldOptimizeRepo(repo.Path) || forceOptimize {
-			// Update status: optimizing
-			progressChan <- RepoProgress{
-				Name:   repo.Name,
-				Status: StatusOptimizing,
-			}
-
-			var err error
-			switch optimizationMode {
-			case OptimizeQuick:
-				err = quickOptimizeRepo(repo.Path, repo.Name)
-			case OptimizeFull:
-				err = fullOptimizeRepo(repo.Path, repo.Name)
-			}
-
-			if err != nil {
-				// Non-fatal: warn and continue with blame
-				if verbose {
-					fmt.Fprintf(os.Stderr, "Warning: optimization failed for %s: %v\n", repo.Name, err)
-				}
-			} else {
-				// Save optimization marker
-				if err := saveOptimizationMarker(repo.Path, optimizationMode); err != nil {
-					if verbose {
-						fmt.Fprintf(os.Stderr, "Warning: failed to save optimization marker for %s: %v\n", repo.Name, err)
-					}
-				}
-			}
-		}
-	}
 
 	// Update status: discovering files
 	progressChan <- RepoProgress{
@@ -1525,9 +1741,9 @@ func preflightCountFiles(repos []RepoInfo, fileLister FileLister) []RepoInfo {
 	startTime := time.Now()
 
 	type countResult struct {
-		repo            RepoInfo
-		needsOptimize   bool
-		err             error
+		repo          RepoInfo
+		needsOptimize bool
+		err           error
 	}
 
 	results := make(chan countResult, len(repos))
@@ -2191,14 +2407,13 @@ func renderRepoLine(p *RepoProgress) int {
 }
 
 // repoWorker processes repositories from a task channel
-func repoWorker(blameWorkers int, optimizationMode OptimizationMode, forceOptimize bool,
-	repoTasks <-chan RepoInfo, results chan<- RepoResult, progressChan chan<- RepoProgress,
+func repoWorker(blameWorkers int, repoTasks <-chan RepoInfo, results chan<- RepoResult, progressChan chan<- RepoProgress,
 	fileStatsChan chan<- FileAuthorStats, commitStatsChan chan<- CommitStatsBatch,
 	fileLister FileLister, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for repo := range repoTasks {
-		err := processRepository(repo, blameWorkers, optimizationMode, forceOptimize, progressChan, fileStatsChan, commitStatsChan, fileLister)
+		err := processRepository(repo, blameWorkers, progressChan, fileStatsChan, commitStatsChan, fileLister)
 
 		result := RepoResult{
 			RepoName: repo.Name,
