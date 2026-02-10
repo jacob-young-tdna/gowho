@@ -74,6 +74,7 @@ const (
 // Timeouts and Intervals
 const (
 	gitBlameTimeout        = 10 * time.Second       // Timeout for individual git blame operations
+	gitLogTimeout          = 5 * time.Minute        // Timeout for commit stats git log
 	batchFlushInterval     = 500 * time.Millisecond // Database batch flush interval
 	progressReportInterval = 200 * time.Millisecond // Repo progress update interval
 	uiTickerInterval       = 100 * time.Millisecond // UI refresh rate
@@ -342,7 +343,8 @@ type AuthorIntern struct {
 func newAuthorIntern() *AuthorIntern {
 	return &AuthorIntern{
 		emailToID: make(map[string]uint32, authorInternCapacity),
-		idToEmail: make([]string, 0, authorInternCapacity),
+		idToEmail: make([]string, 1, authorInternCapacity), // slot 0 reserved as sentinel
+		nextID:    1,                                       // 0 is sentinel for "no author"
 	}
 }
 
@@ -447,8 +449,14 @@ func (GitLsTreeLister) List(repoPath string) ([]string, error) {
 	cmd := exec.Command("git", "-C", repoPath, "ls-tree", "-r", "-z", "--name-only", "HEAD")
 	out, err := cmd.Output()
 	if err != nil {
-		// For unborn HEAD, treat as empty
-		return []string{}, nil
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			stderr := string(exitErr.Stderr)
+			if strings.Contains(stderr, "Not a valid object name") {
+				return []string{}, nil
+			}
+			return nil, fmt.Errorf("git ls-tree failed: %w (stderr: %s)", err, stderr)
+		}
+		return nil, fmt.Errorf("git ls-tree failed: %w", err)
 	}
 
 	raw := bytes.Split(out, []byte{0})
@@ -504,6 +512,12 @@ func (GitLsTreeLister) Count(repoPath string) (int, error) {
 		}
 	}
 	if err := cmd.Wait(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			stderr := string(exitErr.Stderr)
+			if strings.Contains(stderr, "Not a valid object name") {
+				return 0, nil
+			}
+		}
 		return 0, err
 	}
 	return count, nil
@@ -1163,12 +1177,13 @@ func main() {
 				}
 			case strings.HasPrefix(arg, "--jobs="):
 				v := strings.TrimPrefix(arg, "--jobs=")
-				var err error
-				jobs, err = fmt.Sscanf(v, "%d", &jobs)
-				if err != nil || jobs < 1 {
+				var parsed int
+				_, err := fmt.Sscanf(v, "%d", &parsed)
+				if err != nil || parsed < 1 {
 					fmt.Fprintf(os.Stderr, "Invalid --jobs=%s (use positive integer)\n", v)
 					os.Exit(2)
 				}
+				jobs = parsed
 			case arg == "-j" && i+1 < len(os.Args):
 				i++
 				v := os.Args[i]
@@ -1519,13 +1534,16 @@ func processRepository(repo RepoInfo, blameWorkers int,
 		for {
 			select {
 			case <-ticker.C:
-				progressChan <- RepoProgress{
+				select {
+				case progressChan <- RepoProgress{
 					Name:         repo.Name,
 					Status:       StatusBlaming,
 					FilesTotal:   int32(totalFiles),
 					FilesBlamed:  int32(filesBlamed.Load()),
 					FilesSkipped: int32(filesSkipped.Load()),
 					LinesBlamed:  linesBlamed.Load(),
+				}:
+				default:
 				}
 			case <-ctx.Done():
 				return
@@ -1565,7 +1583,7 @@ func processRepository(repo RepoInfo, blameWorkers int,
 		LinesBlamed: linesBlamed.Load(),
 	}
 
-	if err := processCommitStats(repo.Path, repoID, commitStatsChan); err != nil {
+	if err := processCommitStats(context.Background(), repo.Path, repoID, commitStatsChan); err != nil {
 		progressChan <- RepoProgress{
 			Name:         repo.Name,
 			Status:       StatusError,
@@ -1773,12 +1791,16 @@ func preflightCountFiles(repos []RepoInfo, fileLister FileLister) []RepoInfo {
 	// Collect results
 	countedRepos := make([]RepoInfo, 0, len(repos))
 	reposNeedingOptimization := 0
+	skippedRepos := 0
 	for result := range results {
-		if result.err == nil {
-			countedRepos = append(countedRepos, result.repo)
-			if result.needsOptimize {
-				reposNeedingOptimization++
-			}
+		if result.err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: skipping repo %s: %v\n", result.repo.Name, result.err)
+			skippedRepos++
+			continue
+		}
+		countedRepos = append(countedRepos, result.repo)
+		if result.needsOptimize {
+			reposNeedingOptimization++
 		}
 	}
 
@@ -1786,6 +1808,10 @@ func preflightCountFiles(repos []RepoInfo, fileLister FileLister) []RepoInfo {
 	sort.Slice(countedRepos, func(i, j int) bool {
 		return countedRepos[i].FileCount < countedRepos[j].FileCount
 	})
+
+	if skippedRepos > 0 {
+		fmt.Fprintf(os.Stderr, "Pre-flight: skipped %d repositories due to errors\n", skippedRepos)
+	}
 
 	if verbose {
 		elapsed := time.Since(startTime)
@@ -1811,7 +1837,7 @@ func preflightCountFiles(repos []RepoInfo, fileLister FileLister) []RepoInfo {
 // Uses a scanner for streaming to avoid loading entire output into memory
 // Returns map keyed by interned AuthorID instead of email string
 // Accepts a reusable authorCounts map to eliminate per-file allocations
-func parseGitBlamePorcelain(scanner *bufio.Scanner, authorCounts map[uint32]int) map[uint32]int {
+func parseGitBlamePorcelain(scanner *bufio.Scanner, authorCounts map[uint32]int) (map[uint32]int, error) {
 
 	var currentAuthorID uint32
 
@@ -1835,7 +1861,7 @@ func parseGitBlamePorcelain(scanner *bufio.Scanner, authorCounts map[uint32]int)
 		}
 	}
 
-	return authorCounts
+	return authorCounts, scanner.Err()
 }
 
 // blameWorkerState holds reusable buffers for a blame worker
@@ -1881,7 +1907,6 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 
 		// Create a timeout context for this specific git blame operation
 		blameCtx, cancel := context.WithTimeout(ctx, gitBlameTimeout)
-		defer cancel()
 
 		// Run git blame with porcelain format, streaming output
 		cmd := exec.CommandContext(blameCtx, "git", "-C", repoPath, "blame", "--line-porcelain", "-w", "HEAD", "--", task.FilePath)
@@ -1906,7 +1931,7 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 		// Parse streaming output - no buffering of entire file
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(state.scannerBuf, scannerMaxLine)
-		authorCounts := parseGitBlamePorcelain(scanner, state.authorCounts)
+		authorCounts, scanErr := parseGitBlamePorcelain(scanner, state.authorCounts)
 
 		if err := cmd.Wait(); err != nil {
 			// Check if the error is due to timeout
@@ -1925,6 +1950,14 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 				metrics.filesProcessed.Add(1)
 				filesBlamed.Add(1)
 			}
+			cancel()
+			continue
+		}
+
+		if scanErr != nil {
+			metrics.errors.Add(1)
+			metrics.filesProcessed.Add(1)
+			filesBlamed.Add(1)
 			cancel()
 			continue
 		}
@@ -1959,12 +1992,14 @@ func blameWorker(ctx context.Context, repoPath string, repoID uint16, fileTasks 
 
 // processCommitStats analyzes commit history and buckets by time
 // Uses streaming to avoid loading entire commit log into memory
-func processCommitStats(repoPath string, repoID uint16, commitStatsChan chan<- CommitStatsBatch) error {
+func processCommitStats(ctx context.Context, repoPath string, repoID uint16, commitStatsChan chan<- CommitStatsBatch) error {
 	now := time.Now()
 	date12MonthsAgo := now.AddDate(0, -12, 0)
 
 	// Get all commits from last 12 months, streaming output
-	cmd := exec.Command("git", "-C", repoPath, "log",
+	logCtx, logCancel := context.WithTimeout(ctx, gitLogTimeout)
+	defer logCancel()
+	cmd := exec.CommandContext(logCtx, "git", "-C", repoPath, "log",
 		"--since="+date12MonthsAgo.Format("2006-01-02"),
 		"--format=%aI|%ae|%P",
 		"--all")
@@ -2430,7 +2465,7 @@ func generateSummary(db *sql.DB) {
 	_ = db.QueryRow("SELECT SUM(lines) FROM file_author").Scan(&totalLines)
 	_ = db.QueryRow("SELECT COUNT(DISTINCT repo_path, file_path) FROM file_author").Scan(&totalFiles)
 	_ = db.QueryRow("SELECT COUNT(DISTINCT author) FROM file_author").Scan(&totalAuthors)
-	db.QueryRow("SELECT COUNT(DISTINCT repo_path) FROM file_author").Scan(&totalRepos)
+	_ = db.QueryRow("SELECT COUNT(DISTINCT repo_path) FROM file_author").Scan(&totalRepos)
 
 	fmt.Println("Summary Statistics:")
 	fmt.Printf("  Total repositories: %d\n", totalRepos)

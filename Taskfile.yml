@@ -1,0 +1,91 @@
+version: "3"
+
+vars:
+  BINARY: gowho
+  BUILD_DIR: bin
+
+tasks:
+  default:
+    desc: Build the gowho binary (default task)
+    cmds:
+      - task: build
+
+  build:
+    desc: Build the gowho binary
+    cmds:
+      - go build -o {{.BUILD_DIR}}/{{.BINARY}} .
+    generates:
+      - "{{.BUILD_DIR}}/{{.BINARY}}"
+
+  test:
+    desc: Run all tests with race detector
+    cmds:
+      - go test -race -count=1 ./...
+
+  test:short:
+    desc: Run tests without race detector (faster)
+    cmds:
+      - go test -count=1 ./...
+
+  test:verbose:
+    desc: Run tests with verbose output
+    cmds:
+      - go test -v -race -count=1 ./...
+
+  test:coverage:
+    desc: Run tests with coverage report
+    cmds:
+      - go test -race -count=1 -coverprofile=coverage.out ./...
+      - go tool cover -html=coverage.out -o coverage.html
+      - echo "Coverage report generated at coverage.html"
+
+  lint:
+    desc: Run golangci-lint
+    cmds:
+      - golangci-lint run ./...
+
+  lint:fix:
+    desc: Run golangci-lint with auto-fix
+    cmds:
+      - golangci-lint run --fix ./...
+
+  fmt:
+    desc: Format Go code
+    cmds:
+      - go fmt ./...
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf {{.BUILD_DIR}}
+      - rm -f coverage.out coverage.html
+
+  install:
+    desc: Install gowho binary to $GOPATH/bin
+    cmds:
+      - go install .
+
+  run:
+    desc: Build and run gowho (pass args with -- arg1 arg2)
+    cmds:
+      - go run . {{.CLI_ARGS}}
+
+  deps:
+    desc: Download and tidy dependencies
+    cmds:
+      - go mod download
+      - go mod tidy
+
+  all:
+    desc: Run fmt, vet, lint, test, and build
+    cmds:
+      - task: fmt
+      - task: vet
+      - task: lint
+      - task: test
+      - task: build
