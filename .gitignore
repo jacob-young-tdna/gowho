@@ -1,6 +1,6 @@
-gowho
-gowho-*
+bin
 git-who.*
+./gowho
 
 repos/*
 benchmark.sh

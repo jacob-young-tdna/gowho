@@ -13,7 +13,7 @@ tasks:
   build:
     desc: Build the gowho binary
     cmds:
-      - go build -o {{.BUILD_DIR}}/{{.BINARY}} .
+      - go build -o {{.BUILD_DIR}}/{{.BINARY}} ./cmd/gowho
     generates:
       - "{{.BUILD_DIR}}/{{.BINARY}}"
 
@@ -68,12 +68,12 @@ tasks:
   install:
     desc: Install gowho binary to $GOPATH/bin
     cmds:
-      - go install .
+      - go install ./cmd/gowho
 
   run:
     desc: Build and run gowho (pass args with -- arg1 arg2)
     cmds:
-      - go run . {{.CLI_ARGS}}
+      - go run ./cmd/gowho {{.CLI_ARGS}}
 
   deps:
     desc: Download and tidy dependencies
