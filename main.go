@@ -644,19 +644,10 @@ func fullOptimizeRepo(repoPath string, repoName string) error {
 
 	// Repack with speed-optimized settings (depth=5 for fast decompression)
 	// This trades ~25% more disk space for 3-5x faster object access
-	cmd := exec.Command("git", "-C", repoPath, "repack",
-		"-f",          // Force repack even if recent pack exists
-		"-a",          // Pack all objects into single packfile
-		"-d",          // Delete redundant old packfiles
-		"-b",          // Create bitmap index
-		"--depth=5",   // Shallow delta chains for fast decompression
-		"--window=15", // Small window for faster repacking
-		"--threads=0") // Auto-detect CPU count
-
 	// Set timeout for repack (can take 5-30 minutes on large repos)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	cmd = exec.CommandContext(ctx, "git", "-C", repoPath, "repack",
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "repack",
 		"-f", "-a", "-d", "-b", "--depth=5", "--window=15", "--threads=0")
 
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -1294,7 +1285,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error creating database: %v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	// Determine optimal worker counts
 	numCPU := runtime.NumCPU()
@@ -1603,7 +1594,7 @@ func createDatabase() (*sql.DB, error) {
 	}
 
 	// Remove existing database
-	os.Remove(dbFile)
+	_ = os.Remove(dbFile)
 
 	db, err := sql.Open("sqlite", dbFile)
 	if err != nil {
@@ -1696,7 +1687,7 @@ func getFilesAtHEAD(repoPath string) ([]string, error) {
 	fileWalker.SetErrorHandler(errorHandler)
 
 	// Start walking in background
-	go fileWalker.Start()
+	go func() { _ = fileWalker.Start() }()
 
 	// Collect files
 	files := make([]string, 0, fileListCapacity)
@@ -1721,7 +1712,7 @@ func countFilesInRepo(repo RepoInfo) (RepoInfo, error) {
 	}
 	fileWalker.SetErrorHandler(errorHandler)
 
-	go fileWalker.Start()
+	go func() { _ = fileWalker.Start() }()
 
 	count := 0
 	for range fileListQueue {
@@ -2062,7 +2053,7 @@ func writeCommitStatsBatch(db *sql.DB, repoPath string, stats map[uint32]*Commit
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Build multi-row INSERT statement
 	// INSERT INTO author_commit_stats VALUES (?,?,?,?,?,?),(?,?,?,?,?,?)...
@@ -2101,7 +2092,7 @@ func writeBatch(db *sql.DB, batch []FileAuthorStats) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Build multi-row INSERT statement
 	// INSERT INTO file_author VALUES (?,?,?,?),(?,?,?,?),(?,?,?,?)...
@@ -2436,9 +2427,9 @@ func generateSummary(db *sql.DB) {
 
 	// Query summary stats
 	var totalLines, totalFiles, totalAuthors, totalRepos int64
-	db.QueryRow("SELECT SUM(lines) FROM file_author").Scan(&totalLines)
-	db.QueryRow("SELECT COUNT(DISTINCT repo_path, file_path) FROM file_author").Scan(&totalFiles)
-	db.QueryRow("SELECT COUNT(DISTINCT author) FROM file_author").Scan(&totalAuthors)
+	_ = db.QueryRow("SELECT SUM(lines) FROM file_author").Scan(&totalLines)
+	_ = db.QueryRow("SELECT COUNT(DISTINCT repo_path, file_path) FROM file_author").Scan(&totalFiles)
+	_ = db.QueryRow("SELECT COUNT(DISTINCT author) FROM file_author").Scan(&totalAuthors)
 	db.QueryRow("SELECT COUNT(DISTINCT repo_path) FROM file_author").Scan(&totalRepos)
 
 	fmt.Println("Summary Statistics:")
@@ -2472,7 +2463,7 @@ func generateSummary(db *sql.DB) {
 		fmt.Printf("Error querying stats: %v\n", err)
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	fmt.Printf("%-40s %15s %10s %10s %10s %10s\n",
 		"Author", "Lines", "3mo", "6mo", "12mo", "Merges")
