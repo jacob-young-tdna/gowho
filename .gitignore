@@ -3,7 +3,11 @@ gowho-*
 git-who.*
 
 repos/*
+benchmark.sh
+benchmark_results.*
 
+*.md
+!README.md
 
 # Binaries for programs and plugins
 *.exe
