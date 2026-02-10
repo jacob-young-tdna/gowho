@@ -17,8 +17,6 @@ if [ ! -f "$DB1" ]; then
     exit 1
 fi
 
-benchmark.sh
-benchmark_results.*
 if [ ! -f "$DB2" ]; then
     echo "Error: Database file '$DB2' not found"
     exit 1

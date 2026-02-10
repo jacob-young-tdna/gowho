@@ -1,8 +1,8 @@
 # gowho
 
-Tech DNA analysis requires running `git blame` on every file in every repository in a source drop. A naive approach - blame one file at a time, one repo at a time - takes hours on large codebases with 30+ years of history. Shell scripts and Python wrappers hit the same wall: single-threaded blame is the bottleneck.
+Tech DNA analysis requires running `git blame` on every file in every repository in a source drop.
 
-gowho solves this by parallelizing blame across repositories and files simultaneously, streaming the output directly into a SQLite database. It processes hundreds of repos concurrently, skips files that hang, and produces a single queryable database of authorship and commit activity.
+gowho parallelizes lame across repositories and files simultaneously, streaming the output directly into a SQLite database.
 
 ## What it does
 
